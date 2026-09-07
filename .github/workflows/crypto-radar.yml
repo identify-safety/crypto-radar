@@ -2,7 +2,7 @@ name: Crypto Radar
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # 每 30 分钟（UTC）。北京 = UTC+8
+    - cron: '* * * * *'   # 每 30 分钟（UTC）。北京 = UTC+8
   workflow_dispatch:
     inputs:
       force_push:
