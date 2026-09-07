@@ -38,7 +38,7 @@ WATCHLIST = [  # 主流+高流动性 SWAP, funding-rate 单查, 25 个约 10s
     "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "BONK-USDT-SWAP", "TON-USDT-SWAP",
     "UNI-USDT-SWAP",
 ]
-FUND_YEARLY_MIN = 15.0   # 年化 % 阈值
+FUND_YEARLY_MIN = 25.0   # 年化 % 阈值 (2号实测 15% 在 OKX 上太敏感会刷屏, 2026-09-07 调 25)
 FUND_INTERVAL_H = 8.0    # OKX 主流 8h 结算近似(个别 4h, 不精确可接受)
 NEW_LISTING_WIN = 6 * 3600 * 1000       # 上线 6h 内
 UPCOMING_WIN = 48 * 3600 * 1000          # preopen 未来 48h
