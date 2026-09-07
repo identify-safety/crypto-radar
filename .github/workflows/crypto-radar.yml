@@ -1,0 +1,60 @@
+name: Crypto Radar
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # 每 30 分钟（UTC）。北京 = UTC+8
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: 'Force push a test signal to QQ (ignore dedup)'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: crypto-radar
+  cancel-in-progress: false   # 宁可排队，不要打断上一轮
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install asyncpg
+
+      - name: Run radar scan
+        env:
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+          QQ_APP_ID:      ${{ secrets.QQ_APP_ID }}
+          QQ_TOKEN:       ${{ secrets.QQ_TOKEN }}
+          FORCE_PUSH:     ${{ inputs.force_push }}
+          TZ:             'Asia/Shanghai'
+        run: python radar_scan.py
+
+      - name: Report failure
+        if: failure()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "::error::radar scan failed, see logs above"
+          python - <<'PY' || true
+          import os, asyncio, asyncpg
+          async def main():
+              url = os.environ.get("DATABASE_URL")
+              if not url:
+                  return
+              conn = await asyncpg.connect(url)
+              await conn.execute(
+                  "INSERT INTO radar_runs(finished_at, ok, error) VALUES(now(), false, $1)",
+                  "workflow failed - see Actions log",
+              )
+              await conn.close()
+          asyncio.run(main())
+          PY
