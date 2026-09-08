@@ -10,7 +10,9 @@ crypto 机会雷达 OKX/Actions 版 (2026-09-07, 蓬蒿1号 编写, 接口按 2�
   UPCOMING_LISTING  state=preopen 且 listTime 在未来 48h 内 (提前预警, 比币安强)
   FUNDING_ANOMALY   fundingRate 年化 >25%, 来源两类:
                     (a) 固定 WATCHLIST 25 币(沿用旧逻辑)
-                    (b) 上线 <24h 的 live SWAP 新合约(首日费率盯梢, 补 WATCHLIST 覆盖不到的新币)
+                    (b) 上线 <72h 的 live linear SWAP 新合约(覆盖 48h+ 拉盘期;
+                    补 WATCHLIST 覆盖不到的新币; instType=SWAP & ctType=linear
+                    排除币本位逆合约 BTC-USD-SWAP 类)
                     结算周期实测(funding-rate-history 最近两期; 不足两期退回 funding-rate
                     排期时间差), 不再写死 8h
 状态: Neon Postgres (radar_seen 去重+重试, radar_runs 每轮日志), 无本地文件
@@ -54,7 +56,8 @@ WATCHLIST = [  # 主流+高流动性 SWAP, funding-rate 单查, 25 个约 10s
 FUND_YEARLY_MIN = 25.0   # 年化 % 阈值 (2号实测 15% 在 OKX 上太敏感会刷屏, 2026-09-07 调 25)
 FUND_INTERVAL_FALLBACK_H = 8.0  # 实测不到结算周期时的回退值(OKX 主流 8h 近似)
 NEW_LISTING_WIN = 6 * 3600 * 1000       # 上线 6h 内
-NEW_FUNDING_WIN = 24 * 3600 * 1000      # 新合约首日费率盯梢: 上线 24h 内(live SWAP)
+NEW_FUNDING_WIN = 72 * 3600 * 1000      # 新合约费率盯梢: 上线 72h 内(live linear SWAP,
+                                           # 覆盖 48h+ 拉盘期; 613c441 24h 窗口太短会漏第 2-3 天)
 UPCOMING_WIN = 48 * 3600 * 1000          # preopen 未来 48h
 _HDRS = {"User-Agent": "Mozilla/5.0 radar-actions/1.0"}
 
@@ -167,21 +170,13 @@ def scan_listings(insts):
 
 def get_interval_h(inst, fr_row=None):
     """实测结算周期(小时). 优先级:
-    ① funding-rate-history 最近两期 fundingTime 之差(请求要求, 最贴近真实);
-    ② 退回 funding-rate 的 nextFundingTime-fundingTime(新合约上线不久常只有 1 期历史,
-       但排期时间已给出, 比回退 8h 准); 都取不到才回退 FUND_INTERVAL_FALLBACK_H=8h.
-    fr_row 可传入已查到的 funding-rate 响应, 避免重复请求."""
-    # ① funding-rate-history 最近两期
-    try:
-        d = get_json(f"{OKX}/api/v5/public/funding-rate-history?instId={inst}&limit=2")
-        if d.get("code") == "0" and len(d.get("data") or []) >= 2:
-            t0 = int(d["data"][0].get("fundingTime") or 0)
-            t1 = int(d["data"][1].get("fundingTime") or 0)
-            if t0 and t1 and abs(t0 - t1) > 0:
-                return abs(t0 - t1) / 3600.0 / 1000.0
-    except Exception:
-        pass
-    # ② funding-rate 排期时间(优先用已取的 fr_row, 否则现拉)
+    ① fr_row(优先复用) → 用 fundingTime/nextFundingTime 或 fundingTime/prevFundingTime
+       排期差直接算周期(零额外请求; scan_funding_for 已查 funding-rate, 直接复用 row);
+    ② fr_row 缺失或排期信息不全 → 现拉 funding-rate 取排期;
+    ③ 还不行才发 funding-rate-history 取最近两期(精度最高但多 1 个请求).
+    老坑: 613c441 版本对每个币无条件发 history, 即便 fr_row 已有排期也发, 注释
+    "传 row 避免重复请求"名不副实 —— 本版把 fr_row 路径提到首位, history 退到兜底."""
+    # ①/② fr_row 优先 (复用 / 现拉 funding-rate 取排期)
     row = fr_row
     if row is None:
         try:
@@ -200,6 +195,16 @@ def get_interval_h(inst, fr_row=None):
                 return (ft - pft) / 3600.0 / 1000.0
         except Exception:
             pass
+    # ③ row 拿不到 / 排期信息不全 → 发 history 取最近两期差(精度兜底)
+    try:
+        d = get_json(f"{OKX}/api/v5/public/funding-rate-history?instId={inst}&limit=2")
+        if d.get("code") == "0" and len(d.get("data") or []) >= 2:
+            t0 = int(d["data"][0].get("fundingTime") or 0)
+            t1 = int(d["data"][1].get("fundingTime") or 0)
+            if t0 and t1 and abs(t0 - t1) > 0:
+                return abs(t0 - t1) / 3600.0 / 1000.0
+    except Exception:
+        pass
     return FUND_INTERVAL_FALLBACK_H
 
 
@@ -230,12 +235,15 @@ def scan_funding(insts):
 
 
 def scan_new_contracts_funding(insts):
-    """上线 <24h 的 live SWAP → FUNDING_ANOMALY 候选(首日费率盯梢, 补 WATCHLIST 覆盖不到的新币)"""
+    """上线 <72h 的 live linear SWAP → FUNDING_ANOMALY 候选(覆盖 48h+ 拉盘期,
+    补 WATCHLIST 覆盖不到的新币; ctType=linear 排除币本位逆合约)"""
     now_ms = time.time() * 1000
     watch = set(WATCHLIST)
     cand = []
     for it in insts:
         if it.get("instType") != "SWAP":
+            continue
+        if it.get("ctType") != "linear":  # 排除币本位逆合约 (BTC-USD-SWAP 等), 文案面向 USDT 本位
             continue
         if it.get("state") != "live":
             continue
@@ -274,6 +282,7 @@ def sig_text(sig):
 async def amain():
     err = None
     conn = None
+    nscan = 0  # 默认值; 无 DB 时 print 不 NameError (613c441 在 if conn: 内才赋值, 本地无 DB 会 exit 1)
     try:
         conn = await db_connect()
         # 1. instruments
@@ -283,10 +292,11 @@ async def amain():
         insts = d["data"]
         # 2. 新合约候选
         cands = scan_listings(insts)
-        # 3. 费率候选: WATCHLIST 25 币 + 上线<24h 新合约(首日费率盯梢)
+        # 3. 费率候选: WATCHLIST 25 币 + 上线<72h 新合约(覆盖 48h+ 拉盘期)
         fund = scan_funding(insts)
         new_fund = scan_new_contracts_funding(insts)
         fund += new_fund
+        nscan = len(WATCHLIST) + len(new_fund)  # 实际扫的币数(与是否落 DB 无关)
         signals = []
         for typ, inst, lt, st in cands:
             signals.append({"type": typ, "inst": inst, "sig_key": f"{typ}:{inst}:{lt}",
@@ -314,7 +324,6 @@ async def amain():
             elif e:
                 print(f"push fail {key}: {e}")
         if conn:
-            nscan = len(WATCHLIST) + len(new_fund)
             await db_run(conn, True, len(insts), nscan, len(signals), None)
         print(f"OK scanned={len(insts)} fund_scan={nscan} signals={len(signals)} sent={n_sent}")
     except Exception as e:
