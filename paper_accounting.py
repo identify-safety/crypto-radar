@@ -304,12 +304,16 @@ class PaperAccount:
 def _hype_fetch_okx():
     """OKX 现货 HYPE-USDT 日线（优先源）。返回升序 rows[{date,open,close,volume}] 或 None。
 
-    OKX 返回 data 数组最新在前，元素：[ts_ms(UTC开盘), open, high, low, close, vol, ...]
+    OKX 返回 data 数组最新在前，元素：[ts_ms(开盘), open, high, low, close, vol, ...]
+    ⚠️ bar 必须用 1Dutc 而非 1D：OKX 的 1D 是香港时间(UTC+8)对齐
+       （实测 1D 末根 ts=2026-09-07T16:00Z，1Dutc 末根 ts=2026-09-08T00:00Z）。
+       用 1D 会把 HKT 自然日错标成前一 UTC 日（差 1 天），且最新一个已完成的 UTC
+       自然日会被"未收盘"过滤误删 → HYPE 信号比 P1 其余币慢一天，破坏与 V3 的可比性。
     """
     try:
         import time, urllib.request
         url = ("https://www.okx.com/api/v5/market/candles"
-               "?instId=HYPE-USDT&bar=1D&limit=400")
+               "?instId=HYPE-USDT&bar=1Dutc&limit=400")   # 1Dutc: UTC 日界，与 P1 口径一致
         op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         req = urllib.request.Request(url, headers={"User-Agent": "p1-paper/1.0"})
         with op.open(req, timeout=20) as r:
@@ -372,6 +376,9 @@ def _hype_fetch_hl():
         return None
 
 
+HYPE_LAST = {"source": None, "n": 0}   # 最近一次 HYPE 拉数的实际来源/根数（仅用于日志可观测）
+
+
 def _hype_fetch_klines(asof, src_fn=None):
     """拉 HYPE 日线（OKX 优先 + Hyperliquid 备选），返回升序 rows[{date,open,close,volume}] 或 None。
 
@@ -382,8 +389,15 @@ def _hype_fetch_klines(asof, src_fn=None):
     """
     if src_fn is not None:
         rows = src_fn(asof)
+        HYPE_LAST["source"], HYPE_LAST["n"] = "inject", (len(rows) if rows else 0)
     else:
-        rows = _hype_fetch_okx() or _hype_fetch_hl()
+        rows = _hype_fetch_okx()
+        if rows:
+            HYPE_LAST["source"] = "okx"
+        else:
+            rows = _hype_fetch_hl()
+            HYPE_LAST["source"] = "hyperliquid" if rows else None
+        HYPE_LAST["n"] = len(rows) if rows else 0
     if not rows:
         return None
     rows = [r for r in rows if r.get("date", "") <= asof]   # 仅保留 <=asof 的已收盘日线
@@ -656,7 +670,8 @@ async def paper_section(conn, qq_send=None):
             hype_state = await _hype_read_state(conn)
             hype_rows = _hype_fetch_klines(expected)
             if hype_rows is None or len(hype_rows) < HYPE_MIN_KLINES:
-                print("[PAPER] HV3 HYPE 数据不足(无K线/<%d根) → 该币跳过, 照跑其他4币" % HYPE_MIN_KLINES)
+                print("[PAPER] HV3 HYPE 数据不足(src=%s n=%d <%d根) → 该币跳过, 照跑其他4币"
+                      % (HYPE_LAST["source"], HYPE_LAST["n"], HYPE_MIN_KLINES))
                 hype_p1 = {"position": "out", "entry_price": None,
                            "entry_date": None, "exit_price": None}
                 hype_open = float("nan")
@@ -677,6 +692,13 @@ async def paper_section(conn, qq_send=None):
                 # HYPE 成交价来自同一数据源（OKX/HL 日线的 open），
                 # 不能走 fetch_open：Binance 无 HYPEUSDT，会返回 nan 导致买不进。
                 hype_open = _hype_open_for(expected, hype_rows)
+                _sigd = sig if sig else {}
+                print("[PAPER] HV3 HYPE src=%s n=%d asof=%s close=%s hh20=%s ll10=%s "
+                      "vol_ratio=%s action=%s open=%s"
+                      % (HYPE_LAST["source"], len(hype_rows), expected,
+                         _sigd.get("close"), _sigd.get("hh20"), _sigd.get("ll10"),
+                         (_sigd.get("vol_ratio") if _sigd.get("vol_ratio") is not None else "-"),
+                         action if sig else "none", hype_open))
             await _hype_write_state(conn, expected, hype_p1)
             opens[HYPE_SYMBOL] = hype_open
             p1_hv3 = dict(p1)
