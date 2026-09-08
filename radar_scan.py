@@ -598,6 +598,15 @@ async def amain():
             await p1_section(conn)
         except Exception as e:
             print(f"[P1] section failed: {type(e).__name__}: {e}", file=sys.stderr)
+        # 0.5 P1 三方案模拟实盘记账（2026-09-08 新增，独立隔离）
+        #     - 仅在 P1 信号段之后调用，读取 p1_state 的当日变化驱动三账户纸面记账
+        #     - 独立 try/except：记账任何异常只记日志，绝不影响信号段与费率主功能
+        #     - 信号层(p1_*) 完全不动；本段逻辑全在 paper_accounting.py
+        try:
+            from paper_accounting import paper_section as _paper_section
+            await _paper_section(conn)
+        except Exception as e:
+            print(f"[PAPER] section failed: {type(e).__name__}: {e}", file=sys.stderr)
         # 1. instruments
         d = get_json(f"{OKX}/api/v5/public/instruments?instType=SWAP")
         if d.get("code") != "0":
