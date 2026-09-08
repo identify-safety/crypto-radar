@@ -45,6 +45,19 @@ CASH_RATE = 0.05               # 现金年化 5% 计息
 INIT_CASH = 100000.0           # 三账户初始各 10 万 USDT 名义，全现金空仓
 PAPER_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
 
+# ---- HYPE 观察线（HV3 账户，仅池子 DOGE→HYPE 替换）----
+# HYPE(即 Hyperliquid 代币 HYPE)信号在 paper_accounting 内独立自算（不扩展 P1_SYMBOLS、不动信号段/推送段）。
+# 冻结参数与 P1 段完全一致：20日高突破 + 量≥1.5×20日均量 → BUY；破10日低 → SELL。
+# 数据源（任务书 2026-09-08 更新）：Binance 无 HYPEUSDT（现货/合约均 400/-1121）→ 走数据不足兜底；
+#   优先 OKX 现货 HYPE-USDT(/api/v5/market/candles?instId=HYPE-USDT&bar=1D)，
+#   备选 Hyperliquid 原生 API(/info candleSnapshot)。拉数失败或 <60 根 → 数据不足，4 币照跑。
+HYPE_SYMBOL = "HYPEUSDT"    # 观察标的（任务书原符号；Binance 未上架 → 常态数据不足兜底）
+HV3_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", HYPE_SYMBOL]
+P1_HH = 20           # 前 20 日最高收（不含当日）
+P1_LL = 10           # 前 10 日最低收（不含当日）
+P1_VM = 1.5          # 量 ≥ 1.5×20日均量
+HYPE_MIN_KLINES = 60 # 不足 60 根 K 线 → 数据不足（任务书要求）
+
 # 三方案定义（离散写死，不得寻优；与 quant_portfolio_sizing 主测/变体口径一致）
 SCHEMES = {
     "V3": {
@@ -63,8 +76,14 @@ SCHEMES = {
         "weights": {"BTCUSDT": 0.33},
         "cap": 0.33, "rebalance_band": None, "allow_partial": False,
     },
+    "HV3": {
+        "name": "HV3 等权+再平衡(观察·HYPE替DOGE)",
+        "weights": {s: 0.20 for s in HV3_SYMBOLS},
+        "cap": 1.00, "rebalance_band": 0.50, "allow_partial": False,
+    },
 }
-ACCT_ORDER = ["V3", "T10", "T7"]   # 推送/表格固定顺序
+ACCT_ORDER = ["V3", "T10", "T7", "HV3"]   # 推送/表格固定顺序（HV3 末位，标注观察）
+ACCT_DISPLAY = {"HV3": "HV3(观察)"}        # 推送文本里 HV3 的展示名（任务书要求标注）
 
 
 def _iso_date(dt):
@@ -124,14 +143,18 @@ class PaperAccount:
         return float("nan")
 
     # ---- 一个记账轮（对应 run_engine 单 bar j）----
-    def round_step(self, opens, p1_state, asof):
+    def round_step(self, opens, p1_state, asof, symbols=None):
         """执行一个记账轮，返回 (trades, nav, cash_ratio)。
 
         opens    : {symbol: 本轮开盘价}
         p1_state : {symbol: {"position": "in"/"out", "entry_price":.., "entry_date":..}}
                    来自 p1_state 表（P1 信号段已更新）
         asof     : 本轮记账日（ISO date），用于计息 dt 与 NAV 主键
+        symbols  : 本账户参与记账的币种列表（默认 PAPER_SYMBOLS；
+                   HV3 传 HV3_SYMBOLS，使 HYPE 取代 DOGE 进入信号检测）
         """
+        if symbols is None:
+            symbols = PAPER_SYMBOLS
         trades = []
         # (0) 计息（与 run_engine: 轮首、j>0 时按 dt 几何累加）
         if self.last_date:
@@ -225,7 +248,7 @@ class PaperAccount:
             self.pending.pop(s, None)
 
         # (3) 检测 p1_state 当日变化 → 写新 pending（下轮执行，本轮不成交）
-        for s in PAPER_SYMBOLS:
+        for s in symbols:
             st = p1_state.get(s) or {}
             target = st.get("position", "out")
             have = "in" if (self.pos.get(s, {}).get("units", 0.0) > 0) else "out"
@@ -275,6 +298,163 @@ class PaperAccount:
         cash_ratio = (self.cash / nav) if nav > 0 else 1.0
         self.last_date = asof
         return trades, nav, cash_ratio
+
+
+# ===================== HYPE 观察线信号（独立自算，仅 HV3 用）=====================
+def _hype_fetch_okx():
+    """OKX 现货 HYPE-USDT 日线（优先源）。返回升序 rows[{date,open,close,volume}] 或 None。
+
+    OKX 返回 data 数组最新在前，元素：[ts_ms(UTC开盘), open, high, low, close, vol, ...]
+    """
+    try:
+        import time, urllib.request
+        url = ("https://www.okx.com/api/v5/market/candles"
+               "?instId=HYPE-USDT&bar=1D&limit=400")
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(url, headers={"User-Agent": "p1-paper/1.0"})
+        with op.open(req, timeout=20) as r:
+            raw = json.loads(r.read().decode())
+        if not isinstance(raw, dict) or raw.get("code") not in (None, "0"):
+            return None
+        data = raw.get("data") or []
+        if not data:
+            return None
+        now_ms = time.time() * 1000
+        rows = []
+        for c in data:                            # 最新在前
+            ot = int(c[0])                        # 开盘时间 ms(UTC)
+            if ot + 86400000 > now_ms:            # 未收盘当天 K 线丢弃
+                continue
+            d = datetime.datetime.fromtimestamp(ot / 1000, datetime.timezone.utc)
+            rows.append({"date": d.strftime("%Y-%m-%d"),
+                         "open": float(c[1]), "close": float(c[4]),
+                         "volume": float(c[5])})
+        rows.sort(key=lambda x: x["date"])
+        return rows
+    except Exception:
+        return None
+
+
+def _hype_fetch_hl():
+    """Hyperliquid 原生 candleSnapshot（备选源）。返回升序 rows[{date,open,close,volume}] 或 None。
+
+    请求体必须嵌套在 "req" 内，否则 Hyperliquid 报 "Failed to deserialize"。
+    返回对象数组：{t:ms开盘, T:ms收盘, s, o,h,l,c,v(均为字符串), n}
+    """
+    try:
+        import time, urllib.request
+        end = int(time.time() * 1000)
+        start = end - 365 * 3 * 86400000          # 近 3 年，足够 >60 日线
+        body = json.dumps({"type": "candleSnapshot",
+                           "req": {"coin": "HYPE", "interval": "1d",
+                                   "startTime": start, "endTime": end}}).encode()
+        req = urllib.request.Request(
+            "https://api.hyperliquid.xyz/info", data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "p1-paper/1.0"})
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(req, timeout=20) as r:
+            data = json.loads(r.read().decode())
+        if not data:
+            return None
+        now_ms = time.time() * 1000
+        rows = []
+        for c in data:
+            t = int(c["t"])
+            if t + 86400000 > now_ms:             # 未收盘当天 K 线丢弃
+                continue
+            d = datetime.datetime.fromtimestamp(t / 1000, datetime.timezone.utc)
+            rows.append({"date": d.strftime("%Y-%m-%d"),
+                         "open": float(c["o"]), "close": float(c["c"]),
+                         "volume": float(c["v"])})
+        rows.sort(key=lambda x: x["date"])
+        return rows
+    except Exception:
+        return None
+
+
+def _hype_fetch_klines(asof, src_fn=None):
+    """拉 HYPE 日线（OKX 优先 + Hyperliquid 备选），返回升序 rows[{date,open,close,volume}] 或 None。
+
+    None 情形：两源均异常 / HYPE 未上架 / 已收盘日线 < HYPE_MIN_KLINES(60)。
+    后者触发 HV3 的"数据不足"兜底：账户照跑其他4币，HYPE 视为 out。
+    统一丢弃未收盘当天及 >asof 的 K 线，仅保留 date<=asof 的已收盘日线（与 P1 口径一致）。
+    src_fn(asof)->rows 可注入（自测）；注入数据同样执行 asof 过滤与 <60 根阈值判定。
+    """
+    if src_fn is not None:
+        rows = src_fn(asof)
+    else:
+        rows = _hype_fetch_okx() or _hype_fetch_hl()
+    if not rows:
+        return None
+    rows = [r for r in rows if r.get("date", "") <= asof]   # 仅保留 <=asof 的已收盘日线
+    if len(rows) < HYPE_MIN_KLINES:
+        return None
+    return rows
+
+
+def _hype_open_for(asof, rows):
+    """取 asof(或最近 <=asof)当天开盘价作 HYPE 执行价，与 P1 fetch_open 口径一致。
+
+    rows 已升序且已过滤 <=asof → 末位即最近 <=asof 的那根，取其 open。
+    """
+    if not rows:
+        return float("nan")
+    return float(rows[-1]["open"])
+
+
+def _hype_compute_signal(rows):
+    """与 radar_scan.p1_compute_signal 同口径：窗口严格不含当日。返回 dict 或 None(样本不足)。"""
+    if not rows or len(rows) < 21:
+        return None
+    cur = rows[-1]
+    prev = rows[:-1]
+    if len(prev) < 20:
+        return None
+    hh20 = max(r["close"] for r in prev[-P1_HH:])
+    ll10 = min(r["close"] for r in prev[-P1_LL:])
+    vma20 = sum(r["volume"] for r in prev[-20:]) / 20.0
+    vol_ratio = (cur["volume"] / vma20) if vma20 > 0 else float("nan")
+    return {"date": cur["date"], "close": cur["close"], "hh20": hh20, "ll10": ll10,
+            "vma20": vma20, "vol_ratio": vol_ratio,
+            "buy": bool(cur["close"] > hh20 and cur["volume"] >= P1_VM * vma20),
+            "sell": bool(cur["close"] < ll10)}
+
+
+def _hype_decide(position, sig):
+    """状态机：out 只查买、in 只查卖（与 radar_scan.p1_decide 一致）。"""
+    if position == "in":
+        return "SELL" if sig["sell"] else "none"
+    return "BUY" if sig["buy"] else "none"
+
+
+async def _hype_read_state(conn):
+    """读 p1_state.HYPEUSDT 行（不存在则建行）。仅 HV3 维护该行。"""
+    await conn.execute(
+        "INSERT INTO p1_state(symbol, position) VALUES($1,'out') "
+        "ON CONFLICT (symbol) DO NOTHING", HYPE_SYMBOL)
+    r = await conn.fetchrow(
+        "SELECT position, entry_price, entry_date, exit_price, last_date "
+        "FROM p1_state WHERE symbol=$1", HYPE_SYMBOL)
+    if not r:
+        return {"position": "out", "entry_price": None, "entry_date": None,
+                "exit_price": None, "last_date": None}
+    return {"position": r["position"] or "out",
+            "entry_price": float(r["entry_price"]) if r["entry_price"] else None,
+            "entry_date": r["entry_date"],
+            "exit_price": float(r["exit_price"]) if r["exit_price"] else None,
+            "last_date": r["last_date"]}
+
+
+async def _hype_write_state(conn, asof, st):
+    """写回 p1_state.HYPEUSDT（position/进出价/last_date）。P1 信号段不处理该行。"""
+    await conn.execute(
+        "INSERT INTO p1_state(symbol, position, entry_date, entry_price, "
+        "exit_date, exit_price, last_date, updated_at) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,now()) "
+        "ON CONFLICT (symbol) DO UPDATE SET position=$2, entry_date=$3, "
+        "entry_price=$4, exit_date=$5, exit_price=$6, last_date=$7, updated_at=now()",
+        HYPE_SYMBOL, st.get("position", "out"), st.get("entry_date"),
+        st.get("entry_price"), st.get("exit_date"), st.get("exit_price"), asof)
 
 
 # ===================== asyncpg 持久层（云端用，需 asyncpg）=====================
@@ -389,17 +569,18 @@ def _push_text(all_trades):
     lines = ["[P1模拟 %s]" % datetime.datetime.now(
         datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")]
     for acct in ACCT_ORDER:
+        disp = ACCT_DISPLAY.get(acct, acct)
         ts = [t for t in all_trades if t["acct"] == acct]
         if not ts:
             continue
         for t in ts:
             if t["action"] == "BUY":
-                lines.append("%s BUY %s @%s" % (acct, t["symbol"], _fmt_px(t["price"])))
+                lines.append("%s BUY %s @%s" % (disp, t["symbol"], _fmt_px(t["price"])))
             elif t["action"] == "SELL":
                 pnl = (" pnl=%+.2f%%" % t["pnl_pct"]) if t.get("pnl_pct") is not None else ""
-                lines.append("%s SELL %s @%s%s" % (acct, t["symbol"], _fmt_px(t["price"]), pnl))
+                lines.append("%s SELL %s @%s%s" % (disp, t["symbol"], _fmt_px(t["price"]), pnl))
             else:
-                lines.append("%s REBAL %s @%s" % (acct, t["symbol"], _fmt_px(t["price"])))
+                lines.append("%s REBAL %s @%s" % (disp, t["symbol"], _fmt_px(t["price"])))
     return "\n".join(lines)
 
 
@@ -468,12 +649,54 @@ async def paper_section(conn, qq_send=None):
         print("[PAPER] guard: p1_state 尚未全部对齐 expected=%s → skip (retry next gate)" % expected)
         return
 
+    # ---- HV3 观察账户：独立算 HYPE 信号（不碰现有三账户/信号段）----
+    hv3_extras = {}
+    if "HV3" in need:
+        try:
+            hype_state = await _hype_read_state(conn)
+            hype_rows = _hype_fetch_klines(expected)
+            if hype_rows is None or len(hype_rows) < HYPE_MIN_KLINES:
+                print("[PAPER] HV3 HYPE 数据不足(无K线/<%d根) → 该币跳过, 照跑其他4币" % HYPE_MIN_KLINES)
+                hype_p1 = {"position": "out", "entry_price": None,
+                           "entry_date": None, "exit_price": None}
+                hype_open = float("nan")
+            else:
+                sig = _hype_compute_signal(hype_rows)
+                action = _hype_decide(hype_state["position"], sig) if sig else "none"
+                if action == "BUY":
+                    hype_p1 = {"position": "in", "entry_price": sig["close"],
+                               "entry_date": sig["date"], "exit_price": None}
+                elif action == "SELL":
+                    hype_p1 = {"position": "out", "entry_price": None,
+                               "entry_date": None, "exit_price": sig["close"]}
+                else:
+                    hype_p1 = {"position": hype_state["position"],
+                               "entry_price": hype_state.get("entry_price"),
+                               "entry_date": hype_state.get("entry_date"),
+                               "exit_price": hype_state.get("exit_price")}
+                # HYPE 成交价来自同一数据源（OKX/HL 日线的 open），
+                # 不能走 fetch_open：Binance 无 HYPEUSDT，会返回 nan 导致买不进。
+                hype_open = _hype_open_for(expected, hype_rows)
+            await _hype_write_state(conn, expected, hype_p1)
+            opens[HYPE_SYMBOL] = hype_open
+            p1_hv3 = dict(p1)
+            p1_hv3[HYPE_SYMBOL] = hype_p1
+            hv3_extras["HV3"] = (HV3_SYMBOLS, p1_hv3)
+        except Exception as e:
+            print("[PAPER] HV3 HYPE 状态读写异常 → 该币跳过: %s" % e)
+            p1_hv3 = dict(p1)
+            p1_hv3[HYPE_SYMBOL] = {"position": "out", "entry_price": None,
+                                   "entry_date": None, "exit_price": None}
+            opens[HYPE_SYMBOL] = float("nan")
+            hv3_extras["HV3"] = (HV3_SYMBOLS, p1_hv3)
+
     all_trades = []
     for acct in ACCT_ORDER:
         if acct not in need:
             continue
         obj = await paper_load(conn, acct)
-        trades, nav, cr = obj.round_step(opens, p1, expected)
+        syms, p1d = (hv3_extras[acct] if acct in hv3_extras else (PAPER_SYMBOLS, p1))
+        trades, nav, cr = obj.round_step(opens, p1d, expected, symbols=syms)
         await paper_save(conn, acct, obj, trades, nav, cr, expected)
         all_trades.extend(trades)
         print("[PAPER] %s nav=%.2f cash_ratio=%.3f trades=%d" %

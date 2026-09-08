@@ -36,6 +36,12 @@ INSERT INTO p1_state(symbol, position)
 SELECT unnest(ARRAY['BTCUSDT','ETHUSDT','XRPUSDT','SOLUSDT','DOGEUSDT']::text[]), 'out'
 ON CONFLICT (symbol) DO NOTHING;
 
+-- HYPE 观察线标的：由 paper_accounting 运行时写入/维护（HV3 账户用）；
+-- 此处预建以便人工验表。注意 Binance 现货/合约均无 HYPEUSDT（未上架），
+--   实际数据走 OKX 现货 HYPE-USDT / Hyperliquid（见 paper_accounting）。
+INSERT INTO p1_state(symbol, position) VALUES('HYPEUSDT','out')
+ON CONFLICT (symbol) DO NOTHING;
+
 -- 常用查询
 -- 当前状态:   SELECT * FROM p1_state ORDER BY symbol;
 -- 信号历史:   SELECT * FROM p1_log WHERE signal <> 'none' ORDER BY date DESC, symbol;
