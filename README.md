@@ -78,9 +78,29 @@ crypto-radar/
 radar_seen   -- 去重：sig_key UNIQUE
 radar_runs   -- 运行日志
 radar_recent -- 视图：最近 24h 信号
+p1_state     -- P1 持仓状态 + 门控（2026-09-08 新增）
+p1_log       -- P1 每日观测日志（2026-09-08 新增）
 ```
 
-建表 SQL 见交接目录 `schema.sql`（幂等，可重复执行）。
+建表 SQL 见交接目录 `schema.sql`（幂等，可重复执行）；P1 两表见仓库内 `schema_p1.sql`。
+
+---
+
+## P1 日级信号段（2026-09-08 并入）
+
+与费率扫描同一轮跑，检测 5 币现货日线的 P1 放量突破信号。
+
+- **标的**：BTCUSDT / ETHUSDT / XRPUSDT / SOLUSDT / DOGEUSDT
+- **口径**：买 = 收盘破前 20 日高 **且** 量 ≥ 1.5×前 20 日均量；卖 = 收盘破前 10 日低。
+  窗口全部"前 N 根、不含当日"（等价 `rolling(N).shift(1)`），与回测 `quant_pool_backtest.py` 一致。
+- **数据源**：`data-api.binance.vision` 现货日线**直连**（币安主站对美国 IP 451，vision 实测 200）。
+- **门控（关键）**：`p1_state.last_date == UTC当日-1` → 该币跳过且**不拉 K 线**。
+  48 轮/天里只有日线翻转后的第一轮真拉数，其余 47 轮零成本。
+- **推送**：只有 BUY/SELL 切换才推，多币同日**合并成一条**；无切换零推送。
+  推送失败会记进 `radar_seen`（`push_ok=false`），下轮自动补发（否则门控会把这条信号永久跳过）。
+- **隔离**：P1 段整体包在独立 `try/except` 里，任何异常只记日志，不影响费率扫描主功能。
+- **自测**：`python radar_scan.py --p1-selftest`
+  （离线可跑，不写真实库、不发真实推送；设 `P1_TRACK_PATH` 可启用与本机 `p1_track.py` 的逐币口径对照）
 
 本机直连 Neon 无需代理：
 
