@@ -5,12 +5,16 @@
 
 -- 账户主表: 现金 + 最近记账日(last_date, 由记账轮写入 asof) + 行更新时间(updated_at, 仅审计)
 CREATE TABLE IF NOT EXISTS paper_acct(
-    acct        TEXT PRIMARY KEY,           -- 'V3' / 'T10' / 'T7'
+    acct        TEXT PRIMARY KEY,           -- 'V3' / 'V3MA' / 'T10' / 'T7' / 'HV3'
     scheme      TEXT,
     cash        DOUBLE PRECISION,
     last_date   TEXT,                        -- 最近一次成功记账的 asof 日(YYYY-MM-DD); 用于 gate 判定与计息 dt
-    updated_at  TIMESTAMPTZ DEFAULT now()
+    updated_at  TIMESTAMPTZ DEFAULT now(),
+    ma_cstate   TEXT                         -- V3MA 专用: 每币有效乘数落地值 JSON(其他账户为 NULL)
 );
+
+-- 若 paper_acct 已存在(旧部署), 补 ma_cstate 列(幂等; 与 paper_ensure_tables 一致)
+ALTER TABLE paper_acct ADD COLUMN IF NOT EXISTS ma_cstate TEXT;
 
 -- 持仓: 每账户每币一行
 CREATE TABLE IF NOT EXISTS paper_pos(
@@ -55,11 +59,18 @@ CREATE TABLE IF NOT EXISTS paper_nav(
     PRIMARY KEY(acct, date)
 );
 
--- 种子: 三账户全现金 100,000、空仓、无 pending（从部署日空仓起步，不回溯）
+-- 200 日线门控缓冲(V3MA 专用): 每币滚动收盘历史
+CREATE TABLE IF NOT EXISTS paper_ma200(
+    symbol  TEXT PRIMARY KEY,                -- 每币一行
+    buf     TEXT                             -- JSON: [[date, close], ...] 末位=最新已完成日线
+);
+
+-- 种子: 账户全现金 100,000、空仓、无 pending（从部署日空仓起步，不回溯）
 INSERT INTO paper_acct(acct, scheme, cash) VALUES
-    ('V3',  'V3 等权+再平衡', 100000.0),
-    ('T10', '#10 分层cap60',  100000.0),
-    ('T7',  '#7 33%BTC',     100000.0)
+    ('V3',  'V3 等权+再平衡',             100000.0),
+    ('V3MA','V3MA 等权+再平衡(200日线门控)', 100000.0),
+    ('T10', '#10 分层cap60',              100000.0),
+    ('T7',  '#7 33%BTC',                  100000.0)
 ON CONFLICT (acct) DO NOTHING;
 
 -- 常用查询
