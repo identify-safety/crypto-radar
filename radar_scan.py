@@ -328,6 +328,17 @@ def p1_expected_date():
     return (d - datetime.timedelta(days=1)).isoformat()
 
 
+def p1_day_end_ms(asof):
+    """asof(ISO date) 当日 23:59:59.999 的 UTC 毫秒 —— 用作 klines endTime。
+
+    Binance/vision 的 endTime 语义：返回 openTime <= endTime 的 K 线。
+    取当日 23:59:59.999 → 最后一根恰好是 asof 当日那根（实测 2026-09-10 验证，
+    三个随机历史日 BTCUSDT 末根 openTime 严格 == asof）。
+    """
+    d = datetime.datetime.strptime(asof, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+    return int(d.timestamp() * 1000) + P1_DAY_MS - 1
+
+
 def p1_get_json(url, timeout=20):
     """vision 直连：显式 ProxyHandler({}) 禁代理，避免 runner 环境代理干扰。"""
     op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -336,16 +347,34 @@ def p1_get_json(url, timeout=20):
         return json.loads(r.read().decode())
 
 
-def p1_fetch_klines(symbol):
-    """现货日线，只保留已收盘那根；返回升序 rows(date/close/volume)。"""
+def p1_fetch_klines(symbol, asof=None, limit=None):
+    """现货日线，只保留已收盘那根；返回升序 rows(date/close/volume)。
+
+    asof=None（默认，正常轮）：与历史逐字等价 —— URL 不带 endTime，用 now_ms
+        剔除未走完那根。
+    asof='YYYY-MM-DD'（补跑轮）：URL 带 &endTime=<当日 23:59:59.999>，且截断
+        基准改为该 ms 而非 now_ms → 严格只返回 <=asof 的日线，无前视。
+        实测（2026-09-10）：vision 完整支持 endTime，三个随机历史日末根 openTime
+        严格 == asof，五币均返回满 80 根。
+    """
     url = "%s/api/v3/klines?symbol=%s&interval=1d&limit=%d" % (
-        P1_VISION, symbol, P1_KLINE_LIMIT)
+        P1_VISION, symbol, limit or P1_KLINE_LIMIT)
+    if asof:
+        url += "&endTime=%d" % p1_day_end_ms(asof)
     raw = p1_get_json(url)
     now_ms = time.time() * 1000
+    cutoff_ms = p1_day_end_ms(asof) if asof else now_ms
     rows = []
     for k in raw:
         ot = int(k[0])
-        if ot + P1_DAY_MS > now_ms:          # 该日线尚未走完
+        if asof:
+            # 截断基准已是 asof 当日 23:59:59.999，asof 当日那根的 openTime
+            # (=asof 00:00) 必须保留；只剔除 openTime 严格晚于 asof 的。
+            # ⚠️ 不能用 `ot + P1_DAY_MS > cutoff`：那会把 asof 当日那根误杀
+            #    (asof+1 00:00 > asof 23:59:59.999)，窗口少一根、信号整段错位。
+            if ot > cutoff_ms:
+                continue
+        elif ot + P1_DAY_MS > cutoff_ms:      # 该日线尚未走完
             continue
         rows.append({
             "date": datetime.datetime.fromtimestamp(
@@ -493,6 +522,16 @@ async def p1_section(conn):
     if conn is None:
         print("[P1] skipped: no DATABASE_URL (状态权威在 Neon，无库无法门控)")
         return
+    # 补跑锁（任务 A 约束 2）：补跑器正在顺序补跑时，正常 30min 轮必须让路，
+    # 否则正常轮会直接去处理 expected 最新日，与补跑的逐日推进打架。
+    # 锁不可用（表未建 / 查询异常）→ 不阻塞正常轮，fail-open。
+    try:
+        from p1_repair import repair_lock_held
+        if await repair_lock_held(conn):
+            print("[P1] gate: 补跑进行中(lock held) → 本轮让路跳过")
+            return
+    except Exception as _e:
+        print("[P1] repair lock check skipped: %s" % _e, file=sys.stderr)
     expected = p1_expected_date()
     await p1_ensure_tables(conn)
     st_map = await p1_load_state(conn)
@@ -591,6 +630,16 @@ async def amain():
     nscan = 0  # 默认值; 无 DB 时 print 不 NameError (613c441 在 if conn: 内才赋值, 本地无 DB 会 exit 1)
     try:
         conn = await db_connect()
+        # 0. P1 断日补跑（任务 A，2026-09-10 新增，独立隔离）
+        #    - 放在 p1_section 之前：先补齐断档日，再跑正常轮 —— 否则正常轮会
+        #      先把 last_date 推到 expected，补跑器就再也无法识别缺口（锚点被抹掉）。
+        #    - 独立 try/except：补跑任何异常只记日志，正常轮照跑，费率主功能不受影响。
+        #    - 无缺口时只是 2 条轻查询（锁 + p1_state），零拉数。
+        try:
+            from p1_repair import p1_repair_section
+            await p1_repair_section(conn)
+        except Exception as e:
+            print(f"[P1-REPAIR] section failed: {type(e).__name__}: {e}", file=sys.stderr)
         # 0. P1 日级信号（放在费率扫描之前）
         #    - 独立 try/except：P1 任何异常只记日志，不得影响费率主功能
         #    - 放在前面：反过来若费率段抛错，P1 信号也已经推出去了，不会漏单

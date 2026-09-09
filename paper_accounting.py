@@ -35,6 +35,7 @@ P1 三方案模拟实盘记账模块（2026-09-08，蓬蒿2号，任务书 HERME
 """
 
 import os
+import sys
 import json
 import math
 import datetime
@@ -140,13 +141,17 @@ class PaperAccount:
 
     # ---- 开盘价获取（live: binance.vision；测试可注入）----
     @staticmethod
-    def fetch_open(symbol, asof, price_fn=None, raw_fn=None):
+    def fetch_open(symbol, asof, price_fn=None, raw_fn=None, end_ms=None):
         """取 asof 当日(最新已完成日线)开盘价。
 
         price_fn: 注入 (symbol, asof)->price(测试/备选源)。
         raw_fn:   注入 (symbol)->raw Binance 风格 klines[[ot_ms,open,...close],...],
                   仅离线回归测试用, 绕过网络直接验证日期选取逻辑。
-        两者皆 None → 实时从 binance.vision 拉取。
+        end_ms:   asof 当日 23:59:59.999 的 UTC 毫秒。None(默认, 正常轮) → 拉最新
+                  5 根, 行为与历史逐字一致；给定(补跑轮) → URL 带 &endTime=,
+                  拉的是截至 asof 的窗口。
+                  ⚠️ 补跑必需：只拉最新 5 根时, 所有 K 线日期都 > 历史 asof,
+                  `d <= asof` 一条都不成立 → cand=None → 返回 nan, 成交价全废。
         ⚠️ 关键口径(REVIEW 第2轮 bug A 修复): Binance 返回升序 K 线,
         必须取『最后一个 d<=asof』(=asof 当日的已完成日线开盘),
         不能取第一个(第一个=窗口最旧, 会滞后 3-4 天 → 首笔成交价错位,
@@ -161,6 +166,8 @@ class PaperAccount:
                 import urllib.request
                 url = ("https://data-api.binance.vision/api/v3/klines?symbol=%s"
                        "&interval=1d&limit=5" % symbol)
+                if end_ms:
+                    url += "&endTime=%d" % int(end_ms)
                 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 req = urllib.request.Request(url,
                                             headers={"User-Agent": "p1-paper/1.0"})
@@ -585,20 +592,77 @@ class MAGate:
         """rows: [(date, close), ...] 升序; 仅保留末 cap 根。"""
         self.buf[symbol] = list(rows)[-self.cap:]
 
-    def fetch_seed(self, symbol, asof, src_fn=None):
-        """冷启动: 拉取 ≤asof 最近 MA_WARMUP 根日线收盘并 seed。src_fn 可注入(自测)。"""
-        rows = src_fn(asof, symbol) if src_fn is not None else _ma_fetch_closes(symbol, MA_WARMUP, asof)
+    def fetch_seed(self, symbol, asof, src_fn=None, end_ms=None):
+        """冷启动/重播种: 拉取 ≤asof 最近 MA_WARMUP 根日线收盘并 seed。src_fn 可注入(自测)。
+
+        end_ms: asof 当日 23:59:59.999 UTC 毫秒。None(默认) → 拉最新窗口(行为不变)；
+                给定 → 按 endTime 拉历史窗口(补跑轮必需, 否则 d<=asof 全落空)。
+        """
+        rows = src_fn(asof, symbol) if src_fn is not None else _ma_fetch_closes(
+            symbol, MA_WARMUP, asof, end_ms=end_ms)
         if rows:
             self.seed(symbol, rows)
 
     def append(self, symbol, date, close):
-        """追加当日收盘(幂等: 同日不重复)。"""
+        """追加当日收盘(幂等: 同日不重复)。
+
+        ⚠️ 本方法【不校验连续性】——生产路径请用 append_contiguous()。
+        保留裸 append 是为了 seed/测试注入等已知连续的场景。
+        """
         b = self.buf.setdefault(symbol, [])
         if b and b[-1][0] == date:
             return
         b.append((date, float(close)))
         if len(b) > self.cap:
             self.buf[symbol] = b[-self.cap:]
+
+    # ---- 缓冲连续性(2026-09-10 任务C / 审计 D3) ----
+    def last_date(self, symbol):
+        """缓冲末位日期(= 已入缓冲的最新已完成日线日); 空缓冲 → None。"""
+        b = self.buf.get(symbol)
+        return b[-1][0] if b else None
+
+    def lag_days(self, symbol, expected):
+        """expected - 缓冲末位日期 的自然日差。空缓冲/日期不可解析 → None。
+
+        正常态取值: 1(上一轮 append 了 expected-1) 或 0(同轮重跑, 已 append expected)。
+        >1 即缓冲缺根 —— 必须重播种, 否则 MA200 会用旧数据静默滞后(审计 D3)。
+        """
+        d = self.last_date(symbol)
+        if not d:
+            return None
+        try:
+            return (datetime.date.fromisoformat(expected)
+                    - datetime.date.fromisoformat(d)).days
+        except Exception:
+            return None
+
+    def append_contiguous(self, symbol, date, close):
+        """连续性安全的 append。返回 (written: bool, reason: str)。
+
+        仅在以下情形写入: 缓冲为空 / 末位 == date(幂等跳过) / 末位 == date-1(正常接续)。
+        其余(缺口 >1 天、日期倒退、日期不可解析)一律【拒绝写入】并回报原因。
+
+        为什么需要: 裸 append 会把 date 直接接在 date-N 后面, MA200 变成"跨洞窗口",
+        与回测 rolling(200) 不再等价, 且门控判定静默滞后 —— 这正是审计 D3 的隐患。
+        加密现货 7×24 每日都有日线, 故"连续"= 自然日连续, 无交易日历例外。
+        """
+        b = self.buf.get(symbol)
+        if not b:
+            self.append(symbol, date, close)
+            return True, "seeded-empty"
+        last = b[-1][0]
+        if last == date:
+            return False, "idempotent"
+        try:
+            gap = (datetime.date.fromisoformat(date)
+                   - datetime.date.fromisoformat(last)).days
+        except Exception:
+            return False, "bad-date"
+        if gap == 1:
+            self.append(symbol, date, close)
+            return True, "ok"
+        return False, "gap=%dd" % gap
 
     def _ma(self, closes):
         if len(closes) < self.window:
@@ -634,21 +698,28 @@ class MAGate:
         return g
 
 
-def _ma_fetch_closes(symbol, limit, asof):
-    """拉 ≤asof 最近 limit 根日线收盘(冷启动 seed 用)。返回 [(date, close)] 或 None。"""
+def _ma_fetch_closes(symbol, limit, asof, end_ms=None):
+    """拉 ≤asof 最近 limit 根日线收盘(冷启动 seed 用)。返回 [(date, close)] 或 None。
+
+    end_ms: asof 当日 23:59:59.999 UTC 毫秒。None(默认) → 拉最新 limit 根
+            (正常轮行为不变)；给定 → URL 带 &endTime=(补跑轮拉历史窗口)。
+    """
     try:
         import time, urllib.request
         url = ("https://data-api.binance.vision/api/v3/klines?symbol=%s"
                "&interval=1d&limit=%d" % (symbol, limit))
+        if end_ms:
+            url += "&endTime=%d" % int(end_ms)
         op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         req = urllib.request.Request(url, headers={"User-Agent": "p1-paper/1.0"})
         with op.open(req, timeout=30) as r:
             raw = json.loads(r.read().decode())
         now_ms = time.time() * 1000
+        cutoff_ms = int(end_ms) if end_ms else now_ms
         rows = []
         for k in raw:
             ot = int(k[0])
-            if ot + 86400000 > now_ms:      # 剔除未走完那根
+            if ot + 86400000 > cutoff_ms:      # 剔除未走完那根
                 continue
             d = datetime.datetime.fromtimestamp(ot / 1000, datetime.timezone.utc)
             dd = d.strftime("%Y-%m-%d")
@@ -660,13 +731,15 @@ def _ma_fetch_closes(symbol, limit, asof):
         return None
 
 
-def _ma_fetch_oc(symbol, asof, src_fn=None, raw_fn=None):
+def _ma_fetch_oc(symbol, asof, src_fn=None, raw_fn=None, end_ms=None):
     """取 ≤asof 最新已完成日线的 (open, close)。
 
     src_fn: 注入 (asof, symbol)->(open, close)(生产可接 OKX/Binance 备选源)。
     raw_fn: 注入 (symbol)->raw Binance 风格 klines, 仅离线回归测试用,
             绕过网络直接验证日期选取逻辑。
-    两者皆 None → 实时从 binance.vision 拉取。
+    end_ms: asof 当日 23:59:59.999 UTC 毫秒。None(默认) → 拉最新 5 根(行为不变)；
+            给定 → URL 带 &endTime=(补跑轮拉历史窗口, 否则 d<=asof 全落空 → nan)。
+    两者皆 None 且无 raw_fn → 实时从 binance.vision 拉取。
     ⚠️ 关键口径(REVIEW 第2轮 bug B 修复): 升序遍历必须取『最后一个 d<=asof』
     (=asof 当日收盘), 否则会把滞后 3-4 天的收盘价 append 进 MA200 buffer,
     门控序列与真实日历静默错位, 一致性回放必抓。
@@ -680,6 +753,8 @@ def _ma_fetch_oc(symbol, asof, src_fn=None, raw_fn=None):
             import urllib.request
             url = ("https://data-api.binance.vision/api/v3/klines?symbol=%s"
                    "&interval=1d&limit=5" % symbol)
+            if end_ms:
+                url += "&endTime=%d" % int(end_ms)
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             req = urllib.request.Request(url, headers={"User-Agent": "p1-paper/1.0"})
             with op.open(req, timeout=20) as r:
@@ -894,6 +969,16 @@ async def paper_ensure_tables(conn):
         CREATE TABLE IF NOT EXISTS paper_ma200(
             symbol TEXT PRIMARY KEY,        -- 每币一行: 滚动收盘缓冲
             buf TEXT);                       -- JSON: [[date, close], ...] 末位=最新已完成日线
+
+        -- 任务 B(审计 D4) 2026-09-10: 成交推送失败持久化队列。
+        --   原实现推送失败只打日志 —— 成交已入库(paper_trade/paper_nav)但用户永远
+        --   收不到通知, 与 P1 信号段的 p1_retry_pending 不对称。主键 (asof, acct)
+        --   天然幂等: 同一记账日同一账户只留一条待补发, 重入不重复。
+        CREATE TABLE IF NOT EXISTS paper_push_pending(
+            asof TEXT, acct TEXT, payload TEXT,
+            push_ok BOOLEAN DEFAULT false,
+            pushed_at TIMESTAMPTZ DEFAULT now(),
+            PRIMARY KEY(asof, acct));
     """)
     # 已存在的 paper_acct 补列(Neon 旧部署该表无 ma_cstate 列;
     # CREATE TABLE IF NOT EXISTS 对已存在表不会加列, 必须显式 ALTER, 否则 paper_load 选 ma_cstate 会炸)
@@ -1013,14 +1098,129 @@ def _push_text(all_trades):
     return "\n".join(lines)
 
 
+# ===================== 任务 B(审计 D4): 成交推送失败 → 持久化 + 下轮补发 =====================
+async def _paper_mark_pending(conn, asof, trades):
+    """推送失败 → 按 (asof, acct) 落待补发行。
+
+    为什么需要：成交已入库（paper_trade / paper_nav），但用户收不到通知 →
+    "账上动了、人不知道"。与 P1 信号段的 radar_seen + p1_retry_pending 对齐。
+    主键 (asof, acct) 天然幂等：同记账日同账户只留一条，重入不重复。
+    """
+    if not trades:
+        return
+    by_acct = {}
+    for t in trades:
+        by_acct.setdefault(t.get("acct") or "?", []).append(t)
+    for acct, ts in by_acct.items():
+        try:
+            await conn.execute(
+                "INSERT INTO paper_push_pending(asof, acct, payload, push_ok, pushed_at) "
+                "VALUES($1,$2,$3,false,now()) ON CONFLICT (asof, acct) DO UPDATE "
+                "SET payload=$3, push_ok=false, pushed_at=now()",
+                asof, acct, json.dumps(ts, default=str))
+        except Exception as e:
+            print("[PAPER] mark push pending failed(%s %s): %s" % (asof, acct, e),
+                  file=sys.stderr)
+
+
+async def paper_retry_pending(conn, qq_send=None, days=3):
+    """补发近 days 天推送失败的成交（与 p1_retry_pending 同构）。
+
+    无失败行时只是 1 条轻查询。返回补发的成交条数。
+    """
+    if conn is None:
+        return 0
+    try:
+        rows = await conn.fetch(
+            "SELECT asof, acct, payload FROM paper_push_pending "
+            "WHERE push_ok IS NOT TRUE AND pushed_at > now() - interval '%d days'"
+            % int(days))
+    except Exception as e:
+        print("[PAPER] retry query failed: %s" % e, file=sys.stderr)
+        return 0
+    if not rows:
+        return 0
+    trades = []
+    for r in rows:
+        p = r["payload"]
+        if isinstance(p, str):
+            try:
+                p = json.loads(p)
+            except Exception:
+                continue
+        if isinstance(p, list):
+            trades.extend(p)
+    if not trades:
+        return 0
+    if qq_send is None:
+        try:
+            from radar_scan import qq_send_openid as qq_send
+        except Exception:
+            qq_send = None
+    text = _push_text(trades)
+    if not text or not qq_send:
+        return 0
+    asofs = sorted({r["asof"] for r in rows if r["asof"]})
+    span = ("~".join(asofs) if len(asofs) <= 3
+            else "%s...%s" % (asofs[0], asofs[-1]))
+    text = "[P1模拟成交补发 %s]\n" % span + text.split("\n", 1)[-1]
+    try:
+        ok, e = qq_send(text)
+    except Exception as e:
+        ok, e = False, str(e)
+    print("[PAPER] retry push %d trade(s) asof=%s ok=%s %s" % (len(trades), span, ok, e))
+    if ok:
+        for r in rows:
+            try:
+                await conn.execute(
+                    "UPDATE paper_push_pending SET push_ok=true, pushed_at=now() "
+                    "WHERE asof=$1 AND acct=$2", r["asof"], r["acct"])
+            except Exception:
+                pass
+    return len(trades)
+
+
 async def paper_section(conn, qq_send=None):
-    """云端主入口：在 P1 信号段之后调用，独立 try/except 包裹（异常不影响费率段）。
+    """云端主入口（正常轮）：在 P1 信号段之后调用，独立 try/except 包裹（异常不影响费率段）。
 
     qq_send: 可选推送函数(text)->(ok,err)；默认用 radar_scan.qq_send_openid（延迟导入避免耦合）。
     """
     if conn is None:
         print("[PAPER] skipped: no DATABASE_URL")
-        return
+        return None
+    # 补跑锁（任务 A 约束 2）：补跑器正在逐日记账时，正常轮必须让路 —— 否则正常轮
+    # 会直接拿 expected 日数据记账，与补跑的逐日推进冲突（pending 时序/计息 dt 全乱）。
+    # 锁不可用（表未建 / 查询异常）→ fail-open，不阻塞正常记账。
+    try:
+        from p1_repair import repair_lock_held
+        if await repair_lock_held(conn):
+            print("[PAPER] gate: 补跑进行中(lock held) → 本轮让路跳过")
+            return None
+    except Exception as _e:
+        print("[PAPER] repair lock check skipped: %s" % _e, file=sys.stderr)
+    # 动态 import p1_expected_date（同仓库）
+    try:
+        from radar_scan import p1_expected_date
+        expected = p1_expected_date()
+    except Exception:
+        expected = _iso_date(datetime.date.today() - datetime.timedelta(days=1))
+    return await _paper_run_day(conn, expected, qq_send)
+
+
+async def _paper_run_day(conn, expected, qq_send=None, end_ms=None, push=True,
+                         strict_prev=False):
+    """跑【指定日 expected】的一个完整记账轮 —— 正常轮与补跑轮共用同一实现。
+
+    end_ms: expected 当日 23:59:59.999 的 UTC 毫秒。
+            None（正常轮）→ 拉最新窗口，行为与历史逐字一致；
+            给定（补跑轮，任务 A）→ URL 带 &endTime= 拉历史窗口。
+    push:   False → 不推送（补跑轮自己汇总后统一补推，避免一天一条刷屏）。
+    strict_prev: True（补跑轮）→ 账户 last_date 必须 == expected-1 才记账，跳日即跳过。
+
+    返回 dict: {"ok":bool, "accts":[...], "trades":[...], "skipped":str|None}
+      ok=True  → 该日记账完成（accts 非空）或无需记账（accts 空, skipped="already-done"）
+      ok=False → 守护未过/数据不足，该日【未记账】；补跑器见此即停止，留队下轮重试。
+    """
     # 避免与 radar_scan 的循环依赖：按需导入
     if qq_send is None:
         try:
@@ -1028,13 +1228,6 @@ async def paper_section(conn, qq_send=None):
             qq_send = qq_send_openid
         except Exception:
             qq_send = None
-
-    # 动态 import p1_expected_date（同仓库）
-    try:
-        from radar_scan import p1_expected_date
-        expected = p1_expected_date()
-    except Exception:
-        expected = _iso_date(datetime.date.today() - datetime.timedelta(days=1))
 
     await paper_ensure_tables(conn)
     rows = await conn.fetch(
@@ -1044,19 +1237,41 @@ async def paper_section(conn, qq_send=None):
         rows = await conn.fetch("SELECT acct, scheme, cash, last_date FROM paper_acct")
 
     # gate：仅对 last_date != expected 的账户记账（其余轮跳过，幂等）
+    # strict_prev（补跑轮专用）：额外要求 last_date == expected-1 —— 只补"已知最后
+    #   一天的下一天"，中间绝不跳日。跳日意味着中间日的 pending 执行价/计息无法
+    #   忠实回放（补跑会用 expected 的开盘价去执行更早日留下的 pending），宁可
+    #   如实记为"不可回放"也不编造（任务 A 约束 1 / 约束 6）。
     need = []
+    skipped_accts = []
     for r in rows:
         last = r["last_date"] if r["last_date"] else None
-        if last != expected:
-            need.append(r["acct"])
+        if last == expected:
+            continue
+        if strict_prev and last:
+            try:
+                gapd = (datetime.date.fromisoformat(expected)
+                        - datetime.date.fromisoformat(last)).days
+            except Exception:
+                gapd = None
+            if gapd != 1:
+                skipped_accts.append("%s(gap=%sd)" % (r["acct"], gapd))
+                continue
+        need.append(r["acct"])
     if not need:
+        if skipped_accts:
+            print("[PAPER] gate: 无账户可忠实补跑(%s) @expected=%s → 该日留队"
+                  % (",".join(skipped_accts), expected), file=sys.stderr)
+            return {"ok": False, "accts": [], "trades": [],
+                    "skipped": "noncontiguous:%s" % ",".join(skipped_accts)}
         print("[PAPER] gate: all accounted for %s → skip" % expected)
-        return
+        return {"ok": True, "accts": [], "trades": [], "skipped": "already-done"}
     print("[PAPER] gate: 记账 %s @expected=%s" % (",".join(need), expected))
 
     # 取本轮各币开盘价（live: binance.vision；可注入 price_fn 测试）
+    # 补跑轮 end_ms 非空 → 拉的是 asof 当日那根，而不是"最新"那根。
     price_fn = getattr(paper_section, "_price_fn", None)
-    opens = {s: PaperAccount.fetch_open(s, expected, price_fn) for s in PAPER_SYMBOLS}
+    opens = {s: PaperAccount.fetch_open(s, expected, price_fn, end_ms=end_ms)
+             for s in PAPER_SYMBOLS}
 
     # 读 p1_state 当日 position
     st = await conn.fetch(
@@ -1076,23 +1291,59 @@ async def paper_section(conn, qq_send=None):
     if len(st) < len(PAPER_SYMBOLS) or any(
             (p1.get(s, {}).get("last_date") or "") != expected for s in PAPER_SYMBOLS):
         print("[PAPER] guard: p1_state 尚未全部对齐 expected=%s → skip (retry next gate)" % expected)
-        return
+        return {"ok": False, "accts": [], "trades": [], "skipped": "guard-p1-misaligned"}
 
     # ---- V3MA 专用: 维护 200 日线门控缓冲(paper_ma200) ----
+    # 2026-09-10 任务C(审计 D3): 加入"落后自愈"——原实现只在 buf 为空时 fetch_seed,
+    # 非空一律裸 append。vision 连挂 N 天(或单日 close 拉取返回 nan)后缓冲缺 N 根且
+    # 永不重播种 → MA200 用旧数据、门控静默滞后。现在每轮校验末位日期:
+    #   lag == 0/1  → 正常, 直接接续
+    #   lag  > 1    → 自动 fetch_seed 重播种(拉 250 根连续日线, 仍只取 <=expected, 无前视)
+    #   重播种后仍不连续 → 拒绝写入 + 整线跳过本轮记账(宁可漏记也不用错误门控记账),
+    #                      缺口由断日检测脚本(p1_gap_check.py)报出
     ma_gate = None
+    ma_ok = True
     if "V3MA" in need:
         ma_gate = await _load_ma_gate(conn)
         oc_fn = getattr(paper_section, "_oc_fn", None)
+        ma_bad = []
         for s in PAPER_SYMBOLS:
+            lag = ma_gate.lag_days(s, expected)
+            reason = None
             if not ma_gate.buf.get(s):
-                ma_gate.fetch_seed(s, expected, oc_fn)      # 冷启动: 拉 250 根
-            o, c = _ma_fetch_oc(s, expected, oc_fn)         # 当日 (open, close)
-            if math.isfinite(c):
-                ma_gate.append(s, expected, c)              # 增量维护(幂等)
-        nb_below = sum(1 for s in PAPER_SYMBOLS if ma_gate.gate_curr(s))
-        print("[PAPER] V3MA MA200: 禁仓币数=%d (冷启动=%s)" %
-              (nb_below, "是" if any(len(ma_gate.buf.get(s, [])) <= MA_WINDOW
-                                    for s in PAPER_SYMBOLS) else "否"))
+                reason = "cold-start"
+            elif lag is None:
+                reason = "bad-last-date"
+            elif lag > 1:
+                reason = "lag=%dd" % lag
+            if reason:                                       # 冷启动 or 落后 → 重播种
+                before = ma_gate.last_date(s)
+                ma_gate.fetch_seed(s, expected, oc_fn, end_ms=end_ms)
+                print("[PAPER] V3MA MA200 reseed %s (%s): buf_last %s -> %s n=%d"
+                      % (s, reason, before, ma_gate.last_date(s),
+                         len(ma_gate.buf.get(s, []))))
+            o, c = _ma_fetch_oc(s, expected, oc_fn, end_ms=end_ms)   # 当日 (open, close)
+            if not math.isfinite(c):
+                ma_bad.append("%s(close=nan)" % s)
+                print("[PAPER] V3MA MA200 %s 当日收盘拉取失败 → 缓冲不推进"
+                      % s, file=sys.stderr)
+                continue
+            wrote, why = ma_gate.append_contiguous(s, expected, c)
+            if not wrote and why != "idempotent":            # 缺口未修复
+                ma_bad.append("%s(%s)" % (s, why))
+                print("[PAPER] V3MA MA200 %s append 拒绝: %s (末位=%s expected=%s)"
+                      % (s, why, ma_gate.last_date(s), expected), file=sys.stderr)
+        if ma_bad:
+            ma_ok = False
+            print("[PAPER] V3MA guard: MA200 缓冲不连续 %s → 跳过 V3MA 本轮记账"
+                  "(不写 last_date, 下轮重试)" % ",".join(ma_bad), file=sys.stderr)
+            need = [a for a in need if a != "V3MA"]
+        else:
+            nb_below = sum(1 for s in PAPER_SYMBOLS if ma_gate.gate_curr(s))
+            print("[PAPER] V3MA MA200: 禁仓币数=%d (冷启动=%s) buf_last=%s" %
+                  (nb_below, "是" if any(len(ma_gate.buf.get(s, [])) <= MA_WINDOW
+                                        for s in PAPER_SYMBOLS) else "否",
+                   ma_gate.last_date(PAPER_SYMBOLS[0])))
 
     # ---- HV3 观察账户：独立算 HYPE 信号（不碰现有三账户/信号段）----
     hv3_extras = {}
@@ -1161,11 +1412,22 @@ async def paper_section(conn, qq_send=None):
         await _save_ma_gate(conn, ma_gate)
 
     text = _push_text(all_trades)
-    if text and qq_send:
+    if text and qq_send and push:
         ok, e = qq_send(text)
         print("[PAPER] push ok=%s %s" % (ok, e))
+        if not ok:
+            # 任务 B(审计 D4): 失败 → 持久化, 由后续 paper_retry_pending 补发
+            await _paper_mark_pending(conn, expected, all_trades)
     elif text:
-        print("[PAPER] (no push fn) %s" % text.replace("\n", " | "))
+        print("[PAPER] %s %s" % ("(no push fn)" if not qq_send else "(补跑汇总, 本轮不单推)",
+                                 text.replace("\n", " | ")))
+    # 补发上一轮推送失败的成交（无失败行 → 1 条轻查询）
+    if push:
+        try:
+            await paper_retry_pending(conn, qq_send)
+        except Exception as _e:
+            print("[PAPER] retry pending failed: %s" % _e, file=sys.stderr)
+    return {"ok": True, "accts": need, "trades": all_trades, "skipped": None}
 
 
 # 供测试注入价格源（云端默认 None → 走 binance.vision 实时开盘价）
