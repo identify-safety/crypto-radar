@@ -1,0 +1,94 @@
+name: probe-hyperliquid-reachability
+
+# 一次性探针：验证 GitHub Actions runner(美国 Azure) → Hyperliquid / OKX 公开 API 的可达性。
+# 仅 workflow_dispatch 手动触发，不挂 schedule（避免误跑）。
+# 用途：C 方案(对冲路径标注) 要调 HL API，runner→HL 可达性此前未实测；
+#       本探针打印 HL metaAndAssetCtxs / spotMeta + OKX instruments 的 HTTP 状态码、耗时、数据量，
+#       供判断 HL 段在云端能否落地。
+on:
+  workflow_dispatch:
+    inputs:
+      hl_timeout:
+        description: "HL API 超时(秒)"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe Hyperliquid + OKX from GitHub runner
+        env:
+          HL_TIMEOUT: ${{ github.event.inputs.hl_timeout || '20' }}
+        run: |
+          echo "================================================================"
+          echo "runner: $(uname -a)"
+          echo "curl:   $(curl --version | head -1)"
+          echo "python: $(python3 --version 2>&1)"
+          echo "================================================================"
+
+          echo "== [1/4] HL metaAndAssetCtxs =="
+          t0=$(date +%s%3N)
+          code=$(curl -s --max-time "$HL_TIMEOUT" -o hl_meta.json \
+            -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d '{"type":"metaAndAssetCtxs"}' \
+            https://api.hyperliquid.xyz/info)
+          t1=$(date +%s%3N)
+          sz=$(wc -c < hl_meta.json 2>/dev/null || echo 0)
+          echo "HTTP=$code  TIME_MS=$((t1-t0))  BYTES=$sz"
+          if [ "$code" = "200" ] && [ "$sz" -gt 100 ]; then
+            univ=$(python3 -c "import json;d=json.load(open('hl_meta.json'));print(len(d[0]['universe']))" 2>/dev/null || echo ERR)
+            echo "HL perp universe 数量: $univ"
+          else
+            echo "HL metaAndAssetCtxs 不可用(HTTP=$code BYTES=$sz)"
+            head -c 300 hl_meta.json 2>/dev/null; echo
+          fi
+
+          echo "== [2/4] HL spotMeta =="
+          t0=$(date +%s%3N)
+          code=$(curl -s --max-time "$HL_TIMEOUT" -o hl_spot.json \
+            -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d '{"type":"spotMeta"}' \
+            https://api.hyperliquid.xyz/info)
+          t1=$(date +%s%3N)
+          sz=$(wc -c < hl_spot.json 2>/dev/null || echo 0)
+          echo "HTTP=$code  TIME_MS=$((t1-t0))  BYTES=$sz"
+          if [ "$code" = "200" ] && [ "$sz" -gt 100 ]; then
+            pairs=$(python3 -c "import json;d=json.load(open('hl_spot.json'));print(len(d.get('universe',[])))" 2>/dev/null || echo ERR)
+            echo "HL spot 对数量: $pairs"
+          else
+            echo "HL spotMeta 不可用(HTTP=$code BYTES=$sz)"
+            head -c 300 hl_spot.json 2>/dev/null; echo
+          fi
+
+          echo "== [3/4] OKX SPOT instruments (对照, 应可用) =="
+          t0=$(date +%s%3N)
+          code=$(curl -s --max-time "$HL_TIMEOUT" -o okx_spot.json \
+            -w "%{http_code}" \
+            "https://www.okx.com/api/v5/public/instruments?instType=SPOT")
+          t1=$(date +%s%3N)
+          sz=$(wc -c < okx_spot.json 2>/dev/null || echo 0)
+          echo "HTTP=$code  TIME_MS=$((t1-t0))  BYTES=$sz"
+          if [ "$code" = "200" ] && [ "$sz" -gt 100 ]; then
+            n=$(python3 -c "import json;d=json.load(open('okx_spot.json'));print(len(d.get('data',[])))" 2>/dev/null || echo ERR)
+            echo "OKX SPOT 数量: $n"
+          else
+            echo "OKX SPOT 异常(HTTP=$code BYTES=$sz)"
+            head -c 300 okx_spot.json 2>/dev/null; echo
+          fi
+
+          echo "== [4/4] OKX SWAP instruments (对照, 应可用) =="
+          code=$(curl -s --max-time "$HL_TIMEOUT" -o /dev/null -w "%{http_code}" \
+            "https://www.okx.com/api/v5/public/instruments?instType=SWAP")
+          echo "HTTP=$code"
+
+          echo "================================================================"
+          echo "结论: HL metaAndAssetCtxs/spotMeta 均 HTTP=200 且数据非空 → runner→HL 可达, C 方案 HL 段可落地;"
+          echo "       任一 HTTP≠200 或超时 → runner→HL 不可达, HL 段需降级为'仅日志不进推送'(代码已含降级)。"
+          echo "================================================================"
