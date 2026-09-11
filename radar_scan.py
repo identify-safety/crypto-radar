@@ -38,10 +38,42 @@ crypto 机会雷达 OKX/Actions 版 (2026-09-07, 蓬蒿1号 编写, 接口按 2�
      funding-rate-history 最近两期之差优先; 不足两期(新合约常如此)退回 funding-rate 的
      nextFundingTime-fundingTime 之差; 都没有才回退 8h。CNPY 4h 合约应能按 ~199% 年化出信号。
   文案: NEW_LISTING/UPCOMING_LISTING 的"费率/溢价异动我会再推"收敛为"费率异动"(溢价盯梢本期未做)
+
+2026-09-11 2号 新增 C 方案: FUNDING_ANOMALY 推送带「对冲可行性标注」(纯只读, 无任何交易动作):
+  FUNDING_ANOMALY 的旧文案固定写"OKX 现货买入 + 合约同量开空", 但 OKX 大量合约没有现货
+  (实测 463 个 SWAP 基础币中 246 个无 OKX 现货), 其中 174 个是股票/指数永续(instCategory=3),
+  根本不存在"买币现货"一说 —— 旧文案会误导。现在每条信号按下列顺序判定对冲路径并写进文案:
+    ① instCategory=3/4 (股票·指数/商品·外汇永续) → [不可对冲] 无现货概念, 仅观察
+       (若 HL 有同标的合约, 追加"仅可跨所 perp 对冲"及费率差)
+    ② OKX 有该币现货 → [可对冲] OKX 现货买 + 合约空(方向中性)
+    ③ HL 有同标的 perp → [可对冲(跨所)] OKX 空收 + HL 多付, 费率差 = OKX年化 - HL年化(非到手收益)
+    ④ HL 有该币现货 → [待确认] HL 现货深度待查(实测 HL 现货多为长尾 @N 对, 滑点大)
+    ⑤ 确证两侧都无覆盖 → [不可对冲] 无对冲腿, 仅观察
+       (注意: 仅当 HL 合约清单 与 现货清单 均已成功探测才标 NONE;
+        HL 合约清单不可用 → UNKNOWN(见 v3 修法 A); HL 现货清单不可用 → 同款 UNKNOWN(见 v4 P3))
+  对冲上下文每轮只取 3 个请求(OKX SPOT instruments + HL metaAndAssetCtxs + HL spotMeta),
+  三个数据源各自独立 try/except 并分别置 okx_spot_ok / hl_meta_ok / hl_spot_ok 标志
+  (2026-09-11 v2 修复 1号/异源复核 F-1~F-4/F-7):
+    - OKX 现货清单失败/限流/空 → 整段降级 UNKNOWN(绝不把 OKX_SPOT 标的翻成 HL_PERP/NONE)
+    - HL spotMeta 半挂不连坐 hl_perp(MNT 等真·HL_PERP 仍标得出)
+    - 任一数据源失败都记 err(不再静默吞成空集)
+    - universe 与 asset_ctxs 长度不一致显式报错(不静默截断)
+  (2026-09-11 v3 修法 A, 1号 复验):
+    - HL 合约清单不可用(hl_meta_ok=False) → 标 UNKNOWN(不得写"无对冲腿/无同名合约"确定性结论);
+      runner→HL 可达性至今未实测, 这是保护核心功能(标出跨所路径)不被静默误标的兜底
+  (2026-09-11 v4 同款修复, 1号 复验 P3, 不阻塞):
+    - 缺陷换到现货维度: spotMeta 挂(hl_spot_ok=False)时, 本会对 H 等真·HL_SPOT 标的输出确定性
+      "无对冲腿/无同名合约" → 与 detail 自相矛盾(同款缺陷, 只是维度从合约换成现货).
+      修法(同款模式): hl_spot_ok=False 时, 现货维度不得断言"无覆盖", 降级 UNKNOWN;
+      仅当 HL 合约清单 与 现货清单 均已成功探测且确无覆盖, 才标稳态 NONE.
+      影响面: 5 个 HL_SPOT 标的 × spotMeta 故障期(方向保守, 故不卡部署).
+  绝不影响费率扫描主流程(与 P1 段同策)。
+  依据: 同目录 HYPERLIQUID_HEDGE_FEASIBILITY_20260911.md
 """
 import asyncio, json, os, re, sys, time, datetime, urllib.request, urllib.error
 
 OKX = "https://www.okx.com"
+HL_API = "https://api.hyperliquid.xyz/info"
 QQ_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 QQ_API = "https://api.sgroup.qq.com"
 WATCHLIST = [  # 主流+高流动性 SWAP, funding-rate 单查, 25 个约 10s
@@ -260,6 +292,204 @@ def scan_new_contracts_funding(insts):
     return scan_funding_for(cand)
 
 
+# ===================== HEDGE 对冲路径标注（2026-09-11 新增，纯只读） =====================
+# 目标：让每条 FUNDING_ANOMALY 自己说清楚"能不能对冲、走哪条路"，不再无脑写
+# "OKX 现货买入 + 合约开空"。本段不产生任何交易/下单动作。
+#
+# 关键判别位（实测 2026-09-11，OKX instruments?instType=SWAP）:
+#   instCategory=1 → 币类永续（含币本位逆合约 BTC-USD-SWAP）
+#   instCategory=3 → 股票/指数永续（AAPL/TSLA/SPY ... 共 174 个）→ 无"买币现货"概念
+#   instCategory=4 → 商品/外汇永续（XAU/BZ/CL ... 共 8 个）
+# 旧逻辑不区分这三类，是"对冲不了"误报的主要来源。
+HEDGE_CAT_CRYPTO = "1"
+HEDGE_CAT_EQUITY = "3"
+HEDGE_CAT_COMMODITY = "4"
+HEDGE_TAG_LABEL = {
+    "OKX_SPOT": "[可对冲] OKX 现货",
+    "HL_PERP": "[可对冲(跨所)] HL 合约",
+    "HL_SPOT": "[待确认] HL 现货",
+    "NONE": "[不可对冲] 无对冲腿",
+    "UNKNOWN": "[未知] 对冲路径待确认",
+}
+
+
+def hl_post(body, timeout=15):
+    """Hyperliquid info API。本机 + 美国 runner 均实测可直连(2026-09-11 本机确认; runner 待实测)。"""
+    req = urllib.request.Request(
+        HL_API, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 radar-actions/1.0"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def hedge_build_context():
+    """每轮构建一个对冲上下文（3 个请求）。三个数据源各自独立 try/except，绝不抛错到主流程。
+
+    三个独立标志分别记录可用性（2026-09-11 v2 修复 1号/异源复核 F-1/F-2/F-3/F-4/F-7）：
+      okx_spot_ok : OKX 现货清单是否成功取到（code=="0" 且 data 有效且非空）
+      hl_meta_ok  : HL metaAndAssetCtxs 是否成功（hl_perp 可用）
+      hl_spot_ok  : HL spotMeta 是否成功（hl_spot 可用；半挂不影响 hl_perp）
+      err         : 失败原因摘要（任一数据源失败都记，不再静默吞成空集）
+
+    返回 dict:
+      okx_spot: set   OKX live 现货基础币
+      hl_perp : dict  HL 合约名 -> 年化费率 % (HL funding 字段是每小时, *24*365*100 转年化)
+      hl_spot : set   HL 现货基础币名
+    """
+    ctx = {"okx_spot": set(), "hl_perp": {}, "hl_spot": set(),
+           "okx_spot_ok": False, "hl_meta_ok": False, "hl_spot_ok": False, "err": ""}
+
+    # 1) OKX 现货清单（判断有没有"同所现货腿"）
+    #    F-1/F-3 修复：显式查 code=="0" 并覆盖 data:null/[]/缺字段/空；
+    #    失败/限流 → okx_spot_ok=False 且 err 必须落日志（不再静默吞成空集把主流币翻成 HL_PERP）。
+    try:
+        d = get_json(f"{OKX}/api/v5/public/instruments?instType=SPOT")
+        if not isinstance(d, dict) or d.get("code") != "0":
+            raise RuntimeError("OKX_SPOT code=%s msg=%s"
+                               % (d.get("code") if isinstance(d, dict) else "n/a",
+                                  (d.get("msg") if isinstance(d, dict) else "")[:80]))
+        rows = d.get("data")
+        if not isinstance(rows, list):
+            raise RuntimeError("OKX_SPOT data 非数组")
+        if len(rows) == 0:
+            raise RuntimeError("OKX_SPOT data 为空(疑似失败)")
+        ctx["okx_spot"] = {str(i.get("instId", "")).split("-")[0]
+                           for i in rows
+                           if isinstance(i, dict) and i.get("state") == "live" and i.get("instId")}
+        ctx["okx_spot_ok"] = True
+    except Exception as e:
+        ctx["okx_spot_ok"] = False
+        ctx["err"] = "OKX_SPOT:%s:%s" % (type(e).__name__, e)
+
+    # 2) Hyperliquid 合约（metaAndAssetCtxs）—— 独立 try/except
+    #    F-2 修复：与 spotMeta 分开，meta 成功即 hl_perp 可用，不因 spotMeta 单点失败连坐。
+    #    F-7 修复：universe 与 asset_ctxs 长度不一致时显式报错（不再静默截断）。
+    try:
+        ctxs = hl_post({"type": "metaAndAssetCtxs"})
+        universe = (ctxs[0].get("universe") if (isinstance(ctxs, (list, tuple)) and len(ctxs) >= 2
+                                                 and isinstance(ctxs[0], dict)) else None)
+        asset_ctxs = ctxs[1] if (isinstance(ctxs, (list, tuple)) and len(ctxs) >= 2) else None
+        if universe is None or asset_ctxs is None:
+            raise ValueError("HL meta shape mismatch")
+        if len(universe) != len(asset_ctxs):
+            raise ValueError("HL meta len mismatch: universe=%d asset_ctxs=%d"
+                             % (len(universe), len(asset_ctxs)))
+        for u, a in zip(universe, asset_ctxs):
+            if not isinstance(u, dict) or u.get("isDelisted"):
+                continue
+            try:
+                name = u.get("name")
+                if not name:
+                    continue
+                fr = float(a.get("funding") or 0)        # HL 口径: 每小时
+                ctx["hl_perp"][name] = fr * 24 * 365 * 100.0
+            except Exception:
+                continue
+        ctx["hl_meta_ok"] = True
+    except Exception as e:
+        ctx["hl_meta_ok"] = False
+        ctx["err"] = (ctx["err"] + " " if ctx["err"] else "") + "HL_META:%s:%s" % (type(e).__name__, e)
+
+    # 3) Hyperliquid 现货（spotMeta）—— 独立 try/except，失败不影响 hl_perp
+    try:
+        sp = hl_post({"type": "spotMeta"})
+        tokens = sp.get("tokens") or [] if isinstance(sp, dict) else []
+        tokmap = {t["index"]: t["name"] for t in tokens if isinstance(t, dict) and "index" in t}
+        for p in (sp.get("universe") or []):
+            try:
+                tk = p.get("tokens") or []
+                if len(tk) >= 2:
+                    ctx["hl_spot"].add(tokmap[int(tk[0])])
+            except Exception:
+                continue
+        ctx["hl_spot_ok"] = True
+    except Exception as e:
+        ctx["hl_spot_ok"] = False
+        ctx["err"] = (ctx["err"] + " " if ctx["err"] else "") + "HL_SPOT:%s:%s" % (type(e).__name__, e)
+
+    return ctx
+
+
+def hedge_eval(ctx, inst, inst_category, okx_ann):
+    """判定单个合约的对冲路径 → (tag, detail)。纯计算，不联网。
+
+    标签语义（v2 修复 F-1/F-2/F-4）：
+      OKX_SPOT : OKX 确有余币现货 → 方向中性对冲（最稳）
+      HL_PERP  : OKX 无现货、HL 有同标的合约 → 仅可跨所 perp 对冲（费率差，非到手收益）
+      HL_SPOT  : OKX 无现货、HL 有现货（长尾 @N 对，深度待查）
+      NONE     : 已确证两侧都无对冲腿（OKX 侧成功 且 HL 合约清单已成功探测且无覆盖）→ 稳态
+      UNKNOWN  : 数据源不可用→无法给出确定性结论（标签行与 detail 必须同调）:
+                 · OKX 现货清单失败（无法确认 OKX 侧）
+                 · HL 合约清单失败(hl_meta_ok=False)（无法确认跨所 perp 路径, 不得写"无同名合约"）
+                 · HL 现货清单失败(hl_spot_ok=False)（无法确认 HL 现货对冲路径, 不得写"无覆盖"）
+    """
+    base = inst.split("-")[0]
+    cat = str(inst_category or HEDGE_CAT_CRYPTO)
+    okx_spot_ok = ctx.get("okx_spot_ok", False)
+    hl_meta_ok = ctx.get("hl_meta_ok", False)
+    hl_spot_ok = ctx.get("hl_spot_ok", False)
+
+    def _hl_perp_note(prefix, name_collision_risk=False):
+        hl_ann = ctx["hl_perp"].get(base)     # F-5 防御：缺失 → UNKNOWN
+        if hl_ann is None:
+            return "UNKNOWN", f"{prefix}HL 费率缺失, 对冲路径未知, 先别进"
+        net = okx_ann - hl_ann                  # 费率差 = OKX 空收 − HL 多付
+        tail = ""
+        if name_collision_risk:
+            tail = ("; ⚠ 跨所同名标的未必同一 underlying(如 OKX PURR 是股票类、HL PURR 是 "
+                    "memecoin), 人工确认是同一标的后再考虑")
+        return ("HL_PERP",
+                f"{prefix}HL 有同标的合约, 仅可跨所 perp 对冲(OKX 空收 + HL 多付); "
+                f"HL 年化≈{hl_ann:+.0f}% → 费率差≈{net:+.0f}%"
+                f"(未扣手续费/滑点/基差波动, 非到手收益){tail}")
+
+    # cat=3/4：股票/指数/商品/外汇永续 → 无"买币现货"概念（F-4/V3：HL 不可用时降级但
+    # 不升格 UNKNOWN，也不写"不存在现货对冲路径"）
+    if cat in (HEDGE_CAT_EQUITY, HEDGE_CAT_COMMODITY):
+        kind = "股票/指数永续" if cat == HEDGE_CAT_EQUITY else "商品/外汇永续"
+        if hl_meta_ok and base in ctx["hl_perp"]:
+            tag, detail = _hl_perp_note("", name_collision_risk=True)
+            return tag, f"{kind}, 无币现货概念; " + detail
+        # 修法 A (v3): HL 合约清单不可用 → 无法确认跨所路径, 不得写"无同名合约"假断言,
+        # 降级 UNKNOWN（标签行与 detail 同调）
+        if not hl_meta_ok:
+            return "UNKNOWN", f"{kind}, 无币现货概念; HL 合约清单不可用, 跨所路径未知, 先别进"
+        # v4 (P3 同款): HL 现货清单不可用 → 无法确认是否 HL 现货代币, 不得写"无同名合约",
+        # 降级 UNKNOWN（标签行与 detail 同调）
+        if not hl_spot_ok:
+            return "UNKNOWN", f"{kind}, 无币现货概念; HL 现货清单不可用, 跨所路径未知, 先别进"
+        return "NONE", f"{kind}, 无币现货概念; HL 无同名合约, 仅观察"
+
+    # crypto（cat=1 或未知分类 → 按币类处理，F-8 future-proofing）
+    # ① OKX 现货可用且命中 → 方向中性对冲（最稳）
+    if okx_spot_ok and base in ctx["okx_spot"]:
+        return "OKX_SPOT", "OKX 有该币现货, 可现货买入 + 合约同量开空(方向中性)"
+    # ② OKX 现货清单自身失败 → 无法确认 OKX 侧，整段 UNKNOWN（F-1 核心修复：不把
+    #    OKX_SPOT 标的翻成 HL_PERP/NONE，err 已落日志）
+    if not okx_spot_ok:
+        return "UNKNOWN", f"OKX 现货清单获取失败({ctx['err'] or 'unknown'}), 对冲路径未知, 先别进"
+    # 到此：OKX 侧已确认无现货，看 HL
+    # ③ HL perp（即使 spotMeta 半挂也不影响，F-2）
+    if hl_meta_ok and base in ctx["hl_perp"]:
+        return _hl_perp_note("OKX 无该币现货; ")
+    # ④ HL spot（仅当现货清单可用时才能确证）
+    if hl_spot_ok and base in ctx["hl_spot"]:
+        return "HL_SPOT", ("OKX 无该币现货; HL 有现货但多为长尾 @N 对, 深度与滑点需人工确认后再进")
+    # ⑤ HL perp / spot 均不可用或已探测无覆盖。
+    #    关键(v3 修法 A): 若 HL 合约清单本身不可用(hl_meta_ok=False), 则"无同名合约"是假断言
+    #    —— 此时不得给确定性的 NONE, 降级 UNKNOWN(标签行与 detail 同调);
+    #    仅当 HL 合约清单已成功探测(确证无 perp 覆盖)时, 才标稳态 NONE。
+    if not hl_meta_ok:
+        return "UNKNOWN", "OKX 无该币现货; HL 合约清单不可用, 跨所路径未知, 先别进"
+    # v4 (P3 同款): 现货清单不可用(hl_spot_ok=False) → 无法确认是否 HL 现货对冲腿,
+    #    "HL 亦无覆盖"是假断言 —— 降级 UNKNOWN(标签行与 detail 同调);
+    #    仅当 HL 现货清单也已成功探测(确证无 spot 覆盖)时, 才标稳态 NONE。
+    if not hl_spot_ok:
+        return "UNKNOWN", "OKX 无该币现货; HL 现货清单不可用, 现货对冲路径未探明, 先别进"
+    return "NONE", "OKX 无该币现货, HL 合约与现货均无覆盖 → 无对冲腿, 仅观察(方向不中性, 不建议裸吃)"
+
+
 def sig_text(sig):
     typ, inst, payload = sig["type"], sig["inst"], sig["payload"]
     if typ == "NEW_LISTING":
@@ -273,9 +503,21 @@ def sig_text(sig):
     if typ == "FUNDING_ANOMALY":
         iv = payload.get("interval_h")
         iv_s = f"{iv:.0f}h" if iv else f"{FUND_INTERVAL_FALLBACK_H:.0f}h"
-        return (f"[机会雷达 A级 {now_bj()}]\nOKX 费率异动, 吃费率窗口:\n"
+        # 对冲路径标注（纯只读；旧文案无条件写"OKX 现货买入+合约开空"，对无现货腿的合约是误导）
+        hed = payload.get("hedge") or {}
+        tag = hed.get("tag") or "UNKNOWN"
+        detail = hed.get("detail") or "对冲路径未判定"
+        label = HEDGE_TAG_LABEL.get(tag, "[未知]")
+        line = (f"[机会雷达 A级 {now_bj()}]\nOKX 费率异动, 吃费率窗口:\n"
                 f"{inst} {payload['fr']*100:+.4f}%/期 ({iv_s}结算) → 年化约 {payload['ann']:.0f}%\n"
-                f"操作: OKX 现货买入 + 合约同量开空(方向中性). 想进回复 1号 算配比")
+                f"对冲: {label}\n{detail}")
+        if tag == "OKX_SPOT":
+            line += "\n操作: OKX 现货买入 + 合约同量开空(方向中性). 想进回复 1号 算配比"
+        elif tag in ("HL_PERP", "HL_SPOT"):
+            line += "\n操作: 需跨所两腿, 基差与双边保证金自担; 想进先找 1号 算配比"
+        else:
+            line += "\n操作: 无可对冲腿, 建议只观察不下单"
+        return line
     return f"[机会雷达 {now_bj()}]\n{typ}: {inst}"
 
 
@@ -668,16 +910,37 @@ async def amain():
         new_fund = scan_new_contracts_funding(insts)
         fund += new_fund
         nscan = len(WATCHLIST) + len(new_fund)  # 实际扫的币数(与是否落 DB 无关)
+        # 3.5 对冲上下文（C 方案，纯只读；失败只降级不影响主流程）
+        try:
+            hedge_ctx = hedge_build_context()
+            print(f"[HEDGE] okx_spot={len(hedge_ctx['okx_spot'])} "
+                  f"hl_perp={len(hedge_ctx['hl_perp'])} hl_spot={len(hedge_ctx['hl_spot'])} "
+                  f"okx_spot_ok={hedge_ctx['okx_spot_ok']} "
+                  f"hl_meta_ok={hedge_ctx['hl_meta_ok']} hl_spot_ok={hedge_ctx['hl_spot_ok']} "
+                  f"err={hedge_ctx['err'] or '-'}")
+        except Exception as e:
+            hedge_ctx = {"okx_spot": set(), "hl_perp": {}, "hl_spot": set(),
+                         "okx_spot_ok": False, "hl_meta_ok": False, "hl_spot_ok": False,
+                         "err": f"CTX:{type(e).__name__}"}
+            print(f"[HEDGE] context failed: {type(e).__name__}: {e}", file=sys.stderr)
+        cat_map = {i.get("instId"): i.get("instCategory") for i in insts}
         signals = []
         for typ, inst, lt, st in cands:
             signals.append({"type": typ, "inst": inst, "sig_key": f"{typ}:{inst}:{lt}",
                             "payload": {"instId": inst, "listTime": lt, "state": st, "lt": lt}})
         for inst, fr, ann, ft, iv in fund:
             ftk = ft if ft is not None else ""
+            # 对冲路径判定: 需要 instCategory 区分股票/商品永续(无现货概念) 与 币类
+            try:
+                tag, detail = hedge_eval(hedge_ctx, inst, cat_map.get(inst), ann)
+            except Exception as e:
+                tag, detail = "UNKNOWN", f"对冲判定异常({type(e).__name__}), 先别进"
             signals.append({"type": "FUNDING_ANOMALY", "inst": inst,
                             "sig_key": f"FUNDING_ANOMALY:{inst}:{ftk}",
                             "payload": {"instId": inst, "fr": fr, "ann": ann,
-                                        "fundingTime": ft, "interval_h": iv}})
+                                        "fundingTime": ft, "interval_h": iv,
+                                        "instCategory": cat_map.get(inst),
+                                        "hedge": {"tag": tag, "detail": detail}}})
 
         n_sent = 0
         force = os.environ.get("FORCE_PUSH") == "true"
