@@ -1,0 +1,42 @@
+name: _probe-okx-ann
+
+# 临时探针: 在 GitHub Actions US runner 上实测 OKX 公告端点 (用完即删分支)
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: probe okx announcements endpoint variants
+        run: |
+          echo "=== runner egress IP ==="
+          curl -s --max-time 10 https://ifconfig.me || true; echo
+          echo "=== curl version ==="; curl --version | head -1
+
+          B='https://www.okx.com/api/v5'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+
+          show() {
+            local label="$1"; shift
+            local code
+            code=$(curl -s --max-time 25 -o /tmp/body -w '%{http_code}' "$@")
+            printf '%-44s HTTP %s | %s\n' "$label" "$code" "$(head -c 220 /tmp/body | tr '\n' ' ')"
+          }
+
+          echo "--- control (已知 OK) ---"
+          show "control instruments"          "$B/public/instruments?instType=SWAP"
+          echo "--- announcements 变体 ---"
+          show "ann latest-events lang=en-US" "$B/support/announcements?annType=latest-events&page=1&limit=20&lang=en-US"
+          show "ann latest-events lang=zh-CN" "$B/support/announcements?annType=latest-events&page=1&limit=20&lang=zh-CN"
+          show "ann latest-events nolang"     "$B/support/announcements?annType=latest-events&page=1&limit=20"
+          show "ann no-annType"               "$B/support/announcements?page=1&limit=20&lang=en-US"
+          show "ann new-listings"             "$B/support/announcements?annType=announcements-new-listings&page=1&limit=20&lang=en-US"
+          show "ann latest-events UAradar"    -H "User-Agent: Mozilla/5.0 radar-actions/1.0" "$B/support/announcements?annType=latest-events&page=1&limit=20&lang=en-US"
+          show "ann latest-events UAbrowser"  -H "User-Agent: $UA" "$B/support/announcements?annType=latest-events&page=1&limit=20&lang=en-US"
+          show "ann latest-events +AL header" -H "User-Agent: $UA" -H "Accept-Language: en-US" "$B/support/announcements?annType=latest-events&page=1&limit=20"
+          show "ann latest-events +full hdrs" -H "User-Agent: $UA" -H "Accept: application/json" -H "Accept-Language: en-US" -H "Referer: https://www.okx.com/" "$B/support/announcements?annType=latest-events&page=1&limit=20&lang=en-US"
+          show "ann aws host"                 "https://aws.okx.com/api/v5/support/announcements?annType=latest-events&page=1&limit=20&lang=en-US"
+          show "ann www +http1.1"             --http1.1 -H "User-Agent: $UA" "$B/support/announcements?annType=latest-events&page=1&limit=20&lang=en-US"
+          echo "--- done ---"
