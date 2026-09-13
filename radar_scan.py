@@ -8,7 +8,6 @@ crypto 机会雷达 OKX/Actions 版 (2026-09-07, 蓬蒿1号 编写, 接口按 2�
 信号:
   NEW_LISTING       instruments 里 listTime 距今 <6h 的新上线 SWAP
   UPCOMING_LISTING  state=preopen 且 listTime 在未来 48h 内 (提前预警, 比币安强)
-  NEW_COIN_EVENT    OKX latest-events 新币申购/赚币活动(Flash Earn/Airdrop Earn 认购锁仓瓜分新币), 正则零误报; 非打新(IEO), 仅作窗口提醒
   FUNDING_ANOMALY   fundingRate 年化 >25%, 来源两类:
                     (a) 固定 WATCHLIST 25 币(沿用旧逻辑)
                     (b) 上线 <72h 的 live linear SWAP 新合约(覆盖 48h+ 拉盘期;
@@ -93,25 +92,6 @@ NEW_FUNDING_WIN = 72 * 3600 * 1000      # 新合约费率盯梢: 上线 72h 内(
                                            # 覆盖 48h+ 拉盘期; 613c441 24h 窗口太短会漏第 2-3 天)
 UPCOMING_WIN = 48 * 3600 * 1000          # preopen 未来 48h
 _HDRS = {"User-Agent": "Mozilla/5.0 radar-actions/1.0"}
-
-# ---------- OKX 新币申购/赚币活动 (latest-events) ----------
-# 数据源: OKX 公告 support 接口(公开, 美国 runner / 1号 本机可直连; 注意带默认 http_proxy 会 502)
-# 正确 annType = latest-events (带 announcements- 前缀会 HTTP 400 / code=51000)
-# 端点结构(1号 2026-09-13 实弹验证, 见 HERMES_REPLY_20260913_latest_events.md):
-#   GET /api/v5/support/announcements?annType=latest-events&page=1&limit=N&lang=en-US
-#   响应 code=="0", data[0].details[] 每项: annType / title / url / pTime / businessPTime (无 id)
-# 内容: Flash Earn / Airdrop Earn 型活动(用 BTC/OKB/USDT 认购锁仓瓜分新币奖池)。
-#   ※ NOT 打新(IEO/Jumpstart): 全量 49 条 jumpstart|launchpool|申购|认购 0 命中; OKX Jumpstart 自 2025-01 起停更。
-#   → 仅作"别错过窗口"提醒, 非交易信号, 文案不写预期收益(详情页抽不到总认购量, 算不出年化)。
-OKX_ANNOUNCE = f"{OKX}/api/v5/support/announcements"
-NEW_COIN_EVENT_ANN_TYPE = "latest-events"
-NEW_COIN_EVENT_LIMIT = 20     # 只拉第1页(按 pTime 递减, 覆盖最近~66天), 一轮 1 个请求
-try:
-    NEW_COIN_EVENT_FRESH_H = float(os.environ.get("NEW_COIN_EVENT_FRESH_H", "240"))  # 新鲜度闸: 默认 10 天(DOS 实测活动周期≈11天, 360h 会推已结束活动)
-except (TypeError, ValueError):
-    NEW_COIN_EVENT_FRESH_H = 240.0  # env 写非法值(如 abc)时回退, 避免整轮雷达(含费率/P1)起不来
-NEW_COIN_EVENT_RX = re.compile(r"(flash|airdrop)\s+earn(\s+lite)?\b.{0,30}?is\s+now\s+live", re.I)
-# (v2 增量: 公告详情页服务端渲染可抓正文抽认购截止时间, 仅推送时按需拉; 本版先做 title/url/pub_ms 提醒)
 
 
 def get_json(url, timeout=20):
@@ -310,96 +290,6 @@ def scan_new_contracts_funding(insts):
     if not cand:
         return []
     return scan_funding_for(cand)
-
-
-# ===================== OKX 新币申购/赚币活动 (latest-events) 信号 =====================
-def _new_coin_event_kind(title):
-    t = (title or "").lower()
-    return "AIRDROP_EARN" if "airdrop" in t else "FLASH_EARN"
-
-
-def _new_coin_event_summary(title):
-    """中文摘要行: 抽币种 + 奖池(1号 实测 币种26/27, 奖池27/27 可抽); 抽不到返回 ''。"""
-    t = title or ""
-    coin = None
-    m = re.search(r"\(([A-Z0-9]{2,10})\)", t)
-    if not m:
-        m = re.search(r"Get started with ([A-Za-z0-9]+)\s*\(", t)
-    if m:
-        coin = m.group(1)
-    pool = None
-    m2 = re.search(r"share\s+([\d,]+)\s*([A-Za-z0-9]{2,10})", t)
-    if m2:
-        pool = f"{m2.group(2)} {m2.group(1)}"
-    parts = []
-    if coin:
-        parts.append(f"币种 {coin}")
-    if pool:
-        parts.append(f"奖池 {pool}")
-    return " | ".join(parts)
-
-
-def scan_new_coin_events(limit=NEW_COIN_EVENT_LIMIT, lang="en-US"):
-    """OKX latest-events → 新币申购/赚币活动候选。
-
-    只认 Flash Earn / Airdrop Earn 型「认购锁仓瓜分新币」活动(正则 NEW_COIN_EVENT_RX),
-    对 240 条负样本 0 误报。返回 list[dict]: {title, url, pub_ms, kind, item}
-    """
-    out, cut = [], time.time() * 1000 - NEW_COIN_EVENT_FRESH_H * 3600_000
-    try:
-        url = (f"{OKX_ANNOUNCE}?annType={NEW_COIN_EVENT_ANN_TYPE}"
-               f"&page=1&limit={limit}&lang={lang}")
-        d = get_json(url, timeout=20)
-        if str(d.get("code")) != "0":
-            print(f"[NEWCOIN] API code={d.get('code')} msg={d.get('msg')}", file=sys.stderr)
-            return out
-        raw = d.get("data")
-        details = None
-        if isinstance(raw, list):
-            if raw and isinstance(raw[0], dict) and isinstance(raw[0].get("details"), list):
-                details = raw[0]["details"]          # 已知结构: data[0].details
-            elif raw and isinstance(raw[0], dict) and ("title" in raw[0] or "url" in raw[0]):
-                details = raw                        # 兼容: data 本身就是列表
-        if not details:
-            return out
-        for it in details:
-            if not isinstance(it, dict):
-                continue
-            title = (it.get("title") or "").strip()
-            if not title or not NEW_COIN_EVENT_RX.search(title):
-                continue                              # 非申购活动(交易赛/产品更新) → 静默丢弃
-            ann = it.get("annType") or NEW_COIN_EVENT_ANN_TYPE
-            if ann != NEW_COIN_EVENT_ANN_TYPE:
-                continue                             # 客户端兜底(防御非法分类混入)
-            try:
-                pub_ms = int(it.get("pTime") or 0)   # 新鲜度闸用 pTime, 非 businessPTime
-            except (TypeError, ValueError):
-                pub_ms = 0
-            if not pub_ms or pub_ms < cut:
-                continue                             # 无 pTime(异常)或陈年活动 → 不入账不推送
-            out.append({
-                "title": title,
-                "url": it.get("url") or "",
-                "pub_ms": pub_ms,
-                "kind": _new_coin_event_kind(title),
-                "item": it,
-            })
-        print(f"[NEWCOIN] scanned={len(out)}")
-    except Exception as e:
-        print(f"[NEWCOIN] fetch failed: {type(e).__name__}: {e}", file=sys.stderr)
-    return out
-
-
-def new_coin_event_sig_key(item):
-    """新币活动去重 key: 落 url(无 id; ROBO 两场不同活动标题逐字相同, title 去重会吞一场)。"""
-    url = (item.get("url") or "").strip()
-    if url:
-        return f"NEW_COIN_EVENT:{url}"
-    title = (item.get("title") or "").strip()
-    pub_ms = item.get("pub_ms") or 0
-    if title:
-        return f"NEW_COIN_EVENT:{title}|{pub_ms}"
-    return f"NEW_COIN_EVENT:{pub_ms}"
 
 
 # ===================== HEDGE 对冲路径标注（2026-09-11 新增，纯只读） =====================
@@ -628,33 +518,6 @@ def sig_text(sig):
         else:
             line += "\n操作: 无可对冲腿, 建议只观察不下单"
         return line
-    if typ == "NEW_COIN_EVENT":
-        pub = payload.get("pub_ms") or 0
-        when = ""
-        if pub:
-            try:
-                when = datetime.datetime.fromtimestamp(
-                    pub / 1000, datetime.timezone(datetime.timedelta(hours=8))
-                ).strftime("%m-%d %H:%M")
-            except Exception:
-                when = ""
-        url = payload.get("url") or "（见 OKX 官方公告）"
-        age = ""
-        if pub:
-            try:
-                days = (time.time() - pub / 1000) / 86400
-                age = f" | 上线 {days:.0f} 天" if days >= 1 else ""
-            except Exception:
-                age = ""
-        kind = "Airdrop Earn" if payload.get("kind") == "AIRDROP_EARN" else "Flash Earn"
-        summary = _new_coin_event_summary(payload.get("title") or "")
-        head = f"[机会雷达 赚币 {now_bj()}]\nOKX 新币赚币认购 ({kind})"
-        head += f": {summary}\n" if summary else f": {payload.get('title')}\n"
-        return (head +
-                f"公告 {when} (北京时间){age}\n"
-                f"标题(英文原文, 可核对): {payload.get('title')}\n"
-                f"详情: {url}\n"
-                f"说明: 用主流币认购锁仓瓜分新币奖池(份额式), 非打新(IEO)。想参与去 OKX 认购页看额度, 我这边算不出配比")
     return f"[机会雷达 {now_bj()}]\n{typ}: {inst}"
 
 
@@ -1078,18 +941,6 @@ async def amain():
                                         "fundingTime": ft, "interval_h": iv,
                                         "instCategory": cat_map.get(inst),
                                         "hedge": {"tag": tag, "detail": detail}}})
-
-        # 4. OKX 新币申购/赚币活动 (latest-events) 候选 —— 独立 try, 异常只记日志不影响费率主流程
-        try:
-            nce = scan_new_coin_events()
-        except Exception as e:
-            nce = []
-            print(f"[NEWCOIN] scan failed: {type(e).__name__}: {e}", file=sys.stderr)
-        for n in nce:
-            signals.append({"type": "NEW_COIN_EVENT", "inst": n["title"][:48],
-                            "sig_key": new_coin_event_sig_key(n["item"]),
-                            "payload": {"title": n["title"], "url": n["url"],
-                                        "pub_ms": n["pub_ms"], "kind": n["kind"]}})
 
         n_sent = 0
         force = os.environ.get("FORCE_PUSH") == "true"
